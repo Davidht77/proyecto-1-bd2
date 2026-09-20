@@ -252,10 +252,15 @@ class SequentialFile:
             self.n_records += 1
             return RID(page.page_id, slot, "main")
 
-        if self._find_rid(key) is not None:
+        # Una sola pasada: la binaria localiza la pagina, y el recorrido de la
+        # cadena sirve a la vez para detectar duplicados y para elegir donde
+        # insertar. Hacerlo en pasadas separadas triplicaba el I/O, y sobre una
+        # cadena larga ese factor 3 se nota.
+        _, page = self._locate(key)
+        found, _ = page.binary_search(key, self.schema)
+        if found:
             raise DuplicateKeyError(f"la clave {key!r} ya existe")
 
-        _, page = self._locate(key)
         if not page.is_full():
             slot = page.insert_sorted(payload, key, self.schema)
             self._write_main(page)
@@ -282,11 +287,14 @@ class SequentialFile:
             return RID(page.page_id, slot, "overflow")
 
         # Ultima pagina de la cadena cuya primera clave sea <= key; si la clave
-        # es menor que todas, la cabeza.
+        # es menor que todas, la cabeza. El mismo recorrido detecta duplicados,
+        # asi la cadena se lee una vez y no dos.
         objetivo = None
         for page in self._chain_pages(head):
             if page.first_key(self.schema) <= key:
                 objetivo = page
+                if page.binary_search(key, self.schema)[0]:
+                    raise DuplicateKeyError(f"la clave {key!r} ya existe")
             else:
                 break
         if objetivo is None:
