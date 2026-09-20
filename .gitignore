@@ -1,0 +1,7 @@
+enunciado.txt
+__pycache__/
+*.pyc
+.pytest_cache/
+data/*.dat
+data/*.ovf
+.venv/
