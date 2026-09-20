@@ -7,7 +7,7 @@ borrado y comprueba los mismos invariantes en cada etapa.
 
 import random
 
-from backend.organization.sequential_file import SequentialFile
+from backend.structures.sequential_file import SequentialFile
 from backend.storage.schema import Column, ColumnType, Schema
 
 S = Schema([Column("id", ColumnType.INT), Column("v", ColumnType.CHAR, 10)])

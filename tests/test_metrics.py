@@ -6,7 +6,7 @@ fallan. Es la diferencia entre "creemos que cuesta log2(P)" y "lo medimos".
 
 import math
 
-from backend.organization.sequential_file import SequentialFile
+from backend.structures.sequential_file import SequentialFile
 from backend.storage.schema import Column, ColumnType, Schema
 
 S = Schema([Column("id", ColumnType.INT), Column("v", ColumnType.CHAR, 10)])

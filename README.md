@@ -21,7 +21,7 @@ python -m pytest -q
 | `pager.py` | Página 0 autodescriptiva, free-list, I/O por offset (`pread`/`lseek`) |
 | `buffer_pool.py` | Caché LRU write-back, desactivada por defecto |
 
-### `backend/organization/` — organización de archivos
+### `backend/structures/` — organización de archivos
 
 | Módulo | Responsabilidad |
 |---|---|

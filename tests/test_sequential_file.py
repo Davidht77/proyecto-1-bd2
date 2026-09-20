@@ -3,7 +3,7 @@ import random
 
 import pytest
 
-from backend.organization.sequential_file import (
+from backend.structures.sequential_file import (
     DuplicateKeyError,
     SequentialFile,
     UnsupportedKeyType,
