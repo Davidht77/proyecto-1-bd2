@@ -1,0 +1,399 @@
+import math
+import random
+
+import pytest
+
+from backend.organization.sequential_file import (
+    DuplicateKeyError,
+    SequentialFile,
+    UnsupportedKeyType,
+)
+from backend.storage.page import NULL_PAGE
+from backend.storage.schema import Column, ColumnType, Schema
+
+S = Schema([Column("id", ColumnType.INT), Column("v", ColumnType.CHAR, 10)])
+
+
+def rec(k):
+    return (k, f"v{k}")
+
+
+def abrir(tmp_path, nombre="emp", **kw):
+    return SequentialFile(str(tmp_path / nombre), S, **kw)
+
+
+# --------------------------------------------------------------- construccion
+
+
+def test_pk_char_no_soportada(tmp_path):
+    bad = Schema([Column("cod", ColumnType.CHAR, 10), Column("n", ColumnType.INT)])
+    with pytest.raises(UnsupportedKeyType):
+        SequentialFile(str(tmp_path / "x"), bad)
+
+
+def test_archivo_vacio(tmp_path):
+    with abrir(tmp_path) as sf:
+        assert sf.n_records == 0
+        assert sf.page_count == 0
+        assert list(sf.scan()) == []
+
+
+# ------------------------------------------------------------------ bulk_load
+
+
+def test_bulk_load_ordena_y_el_scan_sale_ordenado(tmp_path):
+    with abrir(tmp_path) as sf:
+        sf.bulk_load(rec(k) for k in [30, 10, 50, 20, 40])
+        assert list(sf.scan()) == [rec(k) for k in [10, 20, 30, 40, 50]]
+        assert sf.n_records == 5
+
+
+def test_bulk_load_respeta_el_fill_factor(tmp_path):
+    with abrir(tmp_path, page_size=1024, fill_factor=0.75) as sf:
+        sf.bulk_load(rec(k) for k in range(300))
+        por_pagina = int(sf._capacity * 0.75)
+        assert sf.page_count == math.ceil(300 / por_pagina)
+        for p in range(sf.page_count):
+            assert sf._read_main(p).record_count <= por_pagina
+
+
+def test_low_key_de_la_primera_pagina_es_menos_infinito(tmp_path):
+    with abrir(tmp_path, page_size=1024) as sf:
+        sf.bulk_load(rec(k) for k in range(300))
+        assert sf._read_main(0).get_low_key(S) == -math.inf
+        assert sf._read_main(1).get_low_key(S) > -math.inf
+
+
+def test_bulk_load_persiste(tmp_path):
+    with abrir(tmp_path) as sf:
+        sf.bulk_load(rec(k) for k in range(100))
+    with abrir(tmp_path) as sf:
+        assert sf.n_records == 100
+        assert list(sf.scan()) == [rec(k) for k in range(100)]
+
+
+def test_bulk_load_no_hace_lecturas(tmp_path):
+    with abrir(tmp_path, page_size=1024) as sf:
+        sf.counter.reset()
+        sf.bulk_load(rec(k) for k in range(300))
+        assert sf.counter.disk_reads == 0
+
+
+def test_bulk_load_sobre_archivo_no_vacio_falla(tmp_path):
+    with abrir(tmp_path) as sf:
+        sf.bulk_load([rec(1)])
+        with pytest.raises(ValueError):
+            sf.bulk_load([rec(2)])
+
+
+# --------------------------------------------------------------- localizacion
+
+
+def test_locate_page_devuelve_la_ultima_con_low_key_menor_o_igual(tmp_path):
+    with abrir(tmp_path, page_size=1024) as sf:
+        sf.bulk_load(rec(k) for k in range(300))
+        assert sf._locate_page(-5) == 0  # por debajo de todo => pagina 0
+        assert sf._locate_page(0) == 0
+        ultima = sf.page_count - 1
+        assert sf._locate_page(9999) == ultima  # por encima => ultima pagina
+        for k in range(0, 300, 7):
+            p = sf._locate_page(k)
+            assert sf._read_main(p).get_low_key(S) <= k
+            if p + 1 < sf.page_count:
+                assert sf._read_main(p + 1).get_low_key(S) > k
+
+
+# -------------------------------------------------------------------- busqueda
+
+
+def test_search_encuentra_todo_lo_cargado(tmp_path):
+    with abrir(tmp_path, page_size=1024) as sf:
+        sf.bulk_load(rec(k) for k in range(300))
+        for k in range(300):
+            assert sf.search(k) == rec(k)
+
+
+def test_search_devuelve_none_si_no_existe(tmp_path):
+    with abrir(tmp_path, page_size=1024) as sf:
+        sf.bulk_load(rec(k) for k in range(0, 300, 2))  # solo pares
+        assert sf.search(151) is None
+        assert sf.search(-1) is None
+        assert sf.search(9999) is None
+
+
+def test_search_en_archivo_vacio(tmp_path):
+    with abrir(tmp_path) as sf:
+        assert sf.search(1) is None
+
+
+# ------------------------------------------------------------------- insercion
+
+
+def test_insert_en_archivo_vacio(tmp_path):
+    with abrir(tmp_path) as sf:
+        sf.insert(rec(1))
+        assert sf.search(1) == rec(1)
+        assert sf.n_records == 1
+
+
+@pytest.mark.parametrize("orden", ["asc", "desc", "aleatorio"])
+def test_insert_recupera_todo_en_cualquier_orden(tmp_path, orden):
+    claves = list(range(500))
+    if orden == "desc":
+        claves.reverse()
+    if orden == "aleatorio":
+        random.Random(42).shuffle(claves)
+    with abrir(tmp_path, nombre=orden, page_size=1024) as sf:
+        for k in claves:
+            sf.insert(rec(k))
+        assert sf.n_records == 500
+        for k in claves:
+            assert sf.search(k) == rec(k)
+        assert list(sf.scan()) == [rec(k) for k in range(500)]
+
+
+def test_las_inserciones_van_a_overflow_cuando_la_pagina_se_llena(tmp_path):
+    with abrir(tmp_path, page_size=1024) as sf:
+        sf.bulk_load(rec(k) for k in range(0, 2000, 10))  # huecos de 10
+        paginas_antes = sf.page_count
+        assert sf.n_overflow == 0
+        for k in range(1, 400):
+            if k % 10:
+                sf.insert(rec(k))
+        assert sf.n_overflow > 0
+        assert sf.page_count == paginas_antes  # el area principal no crece
+
+
+def test_clave_duplicada_falla(tmp_path):
+    with abrir(tmp_path) as sf:
+        sf.insert(rec(1))
+        with pytest.raises(DuplicateKeyError):
+            sf.insert(rec(1))
+
+
+def test_duplicado_detectado_en_overflow(tmp_path):
+    with abrir(tmp_path, page_size=1024) as sf:
+        sf.bulk_load(rec(k) for k in range(0, 2000, 10))
+        sf.insert(rec(5))
+        with pytest.raises(DuplicateKeyError):
+            sf.insert(rec(5))
+
+
+def test_la_cadena_de_overflow_queda_ordenada(tmp_path):
+    with abrir(tmp_path, page_size=1024) as sf:
+        sf.bulk_load(rec(k) for k in range(0, 2000, 10))
+        pendientes = [k for k in range(1, 400) if k % 10]
+        random.Random(7).shuffle(pendientes)
+        for k in pendientes:
+            sf.insert(rec(k))
+        for p in range(sf.page_count):
+            cadena = list(sf._chain_pages(sf._read_main(p).aux_page_id))
+            claves = [k for pg in cadena for k in pg.keys(S)]
+            assert claves == sorted(claves)
+
+
+def test_las_inserciones_persisten(tmp_path):
+    with abrir(tmp_path, page_size=1024) as sf:
+        sf.bulk_load(rec(k) for k in range(0, 1000, 10))
+        for k in [1, 2, 3, 501, 502]:
+            sf.insert(rec(k))
+        esperado = list(sf.scan())
+    with abrir(tmp_path, page_size=1024) as sf:
+        assert list(sf.scan()) == esperado
+        assert sf.search(502) == rec(502)
+
+
+# ----------------------------------------------------------------------- rango
+
+
+def cargado(tmp_path, n=500, nombre="rango"):
+    sf = abrir(tmp_path, nombre=nombre, page_size=1024)
+    sf.bulk_load(rec(k) for k in range(n))
+    return sf
+
+
+def test_rango_basico(tmp_path):
+    with cargado(tmp_path) as sf:
+        assert list(sf.range_search(100, 110)) == [rec(k) for k in range(100, 111)]
+
+
+def test_rango_con_limites_inclusivos(tmp_path):
+    with cargado(tmp_path) as sf:
+        assert list(sf.range_search(7, 7)) == [rec(7)]
+
+
+def test_rango_vacio_y_fuera_de_rango(tmp_path):
+    with cargado(tmp_path) as sf:
+        assert list(sf.range_search(10, 5)) == []
+        assert list(sf.range_search(9000, 9999)) == []
+        assert list(sf.range_search(-100, -1)) == []
+
+
+def test_rango_total_equivale_al_scan(tmp_path):
+    with cargado(tmp_path) as sf:
+        assert list(sf.range_search(-(10**9), 10**9)) == list(sf.scan())
+
+
+def test_el_rango_incluye_registros_en_overflow(tmp_path):
+    with abrir(tmp_path, page_size=1024) as sf:
+        sf.bulk_load(rec(k) for k in range(0, 2000, 10))
+        for k in [101, 102, 103]:
+            sf.insert(rec(k))
+        assert list(sf.range_search(100, 110)) == [
+            rec(k) for k in [100, 101, 102, 103, 110]
+        ]
+
+
+def test_el_rango_cruza_varias_paginas(tmp_path):
+    with cargado(tmp_path, n=500, nombre="cruza") as sf:
+        assert list(sf.range_search(5, 495)) == [rec(k) for k in range(5, 496)]
+
+
+# --------------------------------------------------------------------- borrado
+
+
+def test_delete_del_area_principal(tmp_path):
+    with cargado(tmp_path, nombre="del1") as sf:
+        assert sf.delete(250) is True
+        assert sf.search(250) is None
+        assert sf.n_records == 499
+        assert sf.delete(250) is False
+
+
+def test_delete_de_overflow_y_liberacion_de_pagina(tmp_path):
+    # fill_factor=1.0 deja las paginas principales llenas, asi que toda
+    # insercion posterior va forzosamente a overflow.
+    with abrir(tmp_path, page_size=1024, fill_factor=1.0) as sf:
+        sf.bulk_load(rec(k) for k in range(0, 2000, 10))
+        for k in [101, 102, 103]:
+            sf.insert(rec(k))
+        assert sf.n_overflow == 3
+        p = sf._locate_page(101)
+        for k in [101, 102, 103]:
+            assert sf.delete(k) is True
+        assert sf.n_overflow == 0
+        assert sf._read_main(p).aux_page_id == NULL_PAGE
+
+
+def test_borrar_el_primer_registro_no_pierde_su_overflow(tmp_path):
+    """Regresion del bug de diseno: low_key no debe depender del contenido."""
+    with abrir(tmp_path, page_size=1024) as sf:
+        sf.bulk_load(rec(k) for k in range(0, 2000, 10))
+        p = sf._locate_page(500)
+        primera = sf._read_main(p).first_key(S)
+        sf.insert(rec(primera + 1))
+        assert sf.delete(primera) is True
+        assert sf.search(primera + 1) == rec(primera + 1)
+
+
+def test_vaciar_una_pagina_entera_no_rompe_la_busqueda(tmp_path):
+    with abrir(tmp_path, page_size=1024) as sf:
+        sf.bulk_load(rec(k) for k in range(300))
+        p = 2
+        claves = sf._read_main(p).keys(S)
+        for k in claves:
+            assert sf.delete(k) is True
+        assert sf._read_main(p).record_count == 0
+        for k in claves:
+            assert sf.search(k) is None
+        assert sf.search(0) == rec(0)
+        assert sf.search(299) == rec(299)
+
+
+def test_delete_deja_el_scan_ordenado(tmp_path):
+    with cargado(tmp_path, nombre="del2") as sf:
+        for k in range(0, 500, 3):
+            sf.delete(k)
+        restantes = [k for k in range(500) if k % 3]
+        assert list(sf.scan()) == [rec(k) for k in restantes]
+
+
+def test_delete_de_clave_inexistente(tmp_path):
+    with cargado(tmp_path, nombre="del3") as sf:
+        assert sf.delete(99999) is False
+        assert sf.delete(-1) is False
+        assert sf.n_records == 500
+
+
+# -------------------------------------------------------------- reorganizacion
+
+
+def con_overflow(tmp_path, nombre="reorg"):
+    sf = abrir(tmp_path, nombre=nombre, page_size=1024)
+    sf.bulk_load(rec(k) for k in range(0, 4000, 10))
+    for k in range(1, 800):
+        if k % 10:
+            sf.insert(rec(k))
+    assert sf.n_overflow > 0
+    return sf
+
+
+def test_reorganize_conserva_todos_los_registros(tmp_path):
+    with con_overflow(tmp_path, "r1") as sf:
+        antes = list(sf.scan())
+        sf.reorganize()
+        assert list(sf.scan()) == antes
+        assert sf.n_records == len(antes)
+
+
+def test_reorganize_vacia_el_overflow(tmp_path):
+    with con_overflow(tmp_path, "r2") as sf:
+        sf.reorganize()
+        assert sf.n_overflow == 0
+        for p in range(sf.page_count):
+            assert sf._read_main(p).aux_page_id == NULL_PAGE
+
+
+def test_reorganize_respeta_el_fill_factor(tmp_path):
+    with con_overflow(tmp_path, "r3") as sf:
+        sf.reorganize()
+        tope = int(sf._capacity * sf.fill_factor)
+        for p in range(sf.page_count):
+            assert sf._read_main(p).record_count <= tope
+
+
+def test_reorganize_es_idempotente(tmp_path):
+    with con_overflow(tmp_path, "r4") as sf:
+        sf.reorganize()
+        estado = (list(sf.scan()), sf.page_count)
+        sf.reorganize()
+        assert (list(sf.scan()), sf.page_count) == estado
+
+
+def test_reorganize_deja_todo_buscable(tmp_path):
+    with con_overflow(tmp_path, "r5") as sf:
+        claves = [k for k, _ in sf.scan()]
+        sf.reorganize()
+        for k in claves:
+            assert sf.search(k) == rec(k)
+
+
+def test_reorganize_reporta_estadisticas(tmp_path):
+    with con_overflow(tmp_path, "r6") as sf:
+        st = sf.reorganize()
+        assert st.records == sf.n_records
+        assert st.pages_before > 0 and st.pages_after > 0
+        assert st.disk_writes > 0 and st.elapsed_ms >= 0
+        assert st.overflow_pages_freed > 0
+
+
+def test_reorganize_persiste(tmp_path):
+    with con_overflow(tmp_path, "r7") as sf:
+        sf.reorganize()
+        esperado = list(sf.scan())
+    with abrir(tmp_path, nombre="r7", page_size=1024) as sf:
+        assert list(sf.scan()) == esperado
+        assert sf.n_overflow == 0
+
+
+def test_reorganize_de_archivo_vacio_no_falla(tmp_path):
+    with abrir(tmp_path, nombre="r8") as sf:
+        assert sf.reorganize().records == 0
+
+
+def test_se_puede_insertar_despues_de_reorganizar(tmp_path):
+    with con_overflow(tmp_path, "r9") as sf:
+        sf.reorganize()
+        sf.insert(rec(99999))
+        assert sf.search(99999) == rec(99999)
+        assert list(sf.scan())[-1] == rec(99999)

@@ -200,6 +200,15 @@ class Pager:
             self._pwrite(page.page_id, page.to_bytes())
 
     def allocate_page(self, page_type: int = PageType.DATA) -> int:
+        return self.new_page(page_type).page_id
+
+    def new_page(self, page_type: int = PageType.DATA) -> Page:
+        """Asigna una pagina y devuelve el objeto recien construido.
+
+        Evita el read_page de vuelta que haria allocate_page + read_page: una
+        pagina nueva esta vacia por definicion, leerla del disco no aporta nada
+        y falsearia el conteo de I/O de bulk_load.
+        """
         self._check_open()
         if self.free_list_head != NULL_PAGE:
             page_id = self.free_list_head
@@ -213,7 +222,7 @@ class Pager:
         page.page_type = page_type
         # write_page valida contra page_count, que ya fue incrementado arriba.
         self.write_page(page)
-        return page_id
+        return page
 
     def free_page(self, page_id: int) -> None:
         self._check_open()
