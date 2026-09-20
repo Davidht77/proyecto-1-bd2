@@ -417,9 +417,10 @@ class SequentialFile:
         if self.page_count:
             raise ValueError("bulk_load requiere un archivo vacio; usa reorganize()")
 
-        por_pagina = max(1, int(self._capacity * self.fill_factor))
-        for i in range(0, len(ordenados), por_pagina):
-            lote = ordenados[i : i + por_pagina]
+        total = math.ceil(len(ordenados) / max(1, int(self._capacity * self.fill_factor)))
+        i, indice = 0, 0
+        while i < len(ordenados):
+            lote = ordenados[i : i + self._page_budget(indice, total)]
             page = self._new_main_page()
             # low_key(0) es el centinela -inf para que absorba cualquier clave
             # por debajo del minimo actual.
@@ -429,6 +430,8 @@ class SequentialFile:
                     self.schema.pack(registro), self.schema.key_of(registro), self.schema
                 )
             self._write_main(page)
+            i += len(lote)
+            indice += 1
 
         self.n_records = len(ordenados)
         self.n_overflow = 0
@@ -457,9 +460,10 @@ class SequentialFile:
             cache_size=self.cache_size,
             counter=self.counter,
         )
-        por_pagina = max(1, int(self._capacity * self.fill_factor))
-        for i in range(0, len(registros), por_pagina):
-            lote = registros[i : i + por_pagina]
+        total = math.ceil(len(registros) / max(1, int(self._capacity * self.fill_factor)))
+        i, indice = 0, 0
+        while i < len(registros):
+            lote = registros[i : i + self._page_budget(indice, total)]
             page = tmp.new_page(PageType.DATA)
             page.set_low_key(None if i == 0 else self.schema.key_of(lote[0]), self.schema)
             for registro in lote:
@@ -467,6 +471,8 @@ class SequentialFile:
                     self.schema.pack(registro), self.schema.key_of(registro), self.schema
                 )
             tmp.write_page(page)
+            i += len(lote)
+            indice += 1
         tmp.user_a = len(registros)
         tmp.user_b = 0
         tmp.close()
@@ -492,19 +498,57 @@ class SequentialFile:
 
     # --------------------------------------------------- politicas (spec seccion 5)
 
-    def _should_reorganize(self) -> bool:
-        """Decision abierta 1: umbral de reorganizacion automatica.
+    @property
+    def overflow_ratio(self) -> float:
+        """Fraccion de registros que viven en el area de overflow."""
+        return self.n_overflow / max(1, self.n_records)
 
-        Opciones a evaluar:
-          - ratio:   self.n_overflow / max(1, self.n_records) > umbral
-          - cadena:  longitud maxima de una cadena > umbral
-          - manual:  False (actual)
+    def _should_reorganize(self) -> bool:
+        """DECISION ABIERTA 1: cuando dispara la reorganizacion automatica.
+
+        Datos medidos sobre 100k registros, B=4096, 3000 inserciones posteriores:
+
+            estado                     lecturas por busqueda
+            recien reorganizado                 11.0
+            3% en overflow (disperso)           40.5
+            3% en overflow (monotono)           88.9
+
+        Y una reorganizacion completa de 120k registros cuesta ~2.3k lecturas
+        + 4.3k escrituras (~1.8 s).
+
+        Opciones:
+          A) ratio:   return self.overflow_ratio > 0.20
+          B) cadena:  llevar la longitud maxima de cadena y comparar con un tope
+          C) manual:  return False  (actual; solo POST /api/tables/reorganize)
 
         Trade-off: un umbral bajo mantiene las busquedas cerca de log2(P) pero
-        paga reescrituras completas frecuentes (P+O lecturas, P' escrituras);
-        uno alto amortiza el costo pero deja degradar las busquedas.
+        paga reescrituras completas frecuentes; uno alto amortiza ese costo pero
+        deja degradar las busquedas. Ojo con el efecto secundario: si el umbral
+        es muy bajo, el Experimento 1 (costo de insercion masiva) va a medir
+        sobre todo reorganizaciones, no inserciones.
+
+        TODO: elegir politica e implementarla.
         """
         return False
+
+    def _page_budget(self, indice_pagina: int, total_paginas: int) -> int:
+        """DECISION ABIERTA 2: cuantos registros pone reorganize en cada pagina.
+
+        Actualmente es uniforme: floor(capacity * fill_factor), el 75% que pide
+        el enunciado. Con capacity=75 son 56 registros y 19 slots libres por
+        pagina, que absorben las siguientes ~19 inserciones de ese rango sin
+        tocar overflow.
+
+        Alternativa a considerar: si las claves crecen de forma monotona (ids
+        autoincrementales, timestamps), todas las inserciones caen en la ULTIMA
+        pagina y las 19 holguras de las demas nunca se usan. Ahi conviene
+        llenar las primeras paginas al 80% y dejar la ultima mucho mas vacia.
+        La medicion de arriba muestra el costo de no hacerlo: 88.9 lecturas por
+        busqueda con claves monotonas frente a 40.5 con claves dispersas.
+
+        TODO: decidir si se mantiene uniforme o se sesga hacia el final.
+        """
+        return max(1, int(self._capacity * self.fill_factor))
 
     # ---------------------------------------------------------------------- misc
 
