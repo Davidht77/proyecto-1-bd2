@@ -153,7 +153,7 @@ def test_insert_recupera_todo_en_cualquier_orden(tmp_path, orden):
 
 
 def test_las_inserciones_van_a_overflow_cuando_la_pagina_se_llena(tmp_path):
-    with abrir(tmp_path, page_size=1024) as sf:
+    with abrir(tmp_path, page_size=1024, auto_reorganize=False) as sf:
         sf.bulk_load(rec(k) for k in range(0, 2000, 10))  # huecos de 10
         paginas_antes = sf.page_count
         assert sf.n_overflow == 0
@@ -397,3 +397,97 @@ def test_se_puede_insertar_despues_de_reorganizar(tmp_path):
         sf.insert(rec(99999))
         assert sf.search(99999) == rec(99999)
         assert list(sf.scan())[-1] == rec(99999)
+
+
+# ------------------------------------------- reorganizacion automatica (cap K)
+
+
+def test_el_cap_de_overflow_escala_con_log2_P(tmp_path):
+    """K = (C/2) * ceil(log2(P)).
+
+    El factor 1/2 sale del split 50/50: las paginas de overflow quedan entre el
+    50% y el 100% ocupadas, asi que K registros ocupan hasta 2K/C paginas.
+    """
+    with abrir(tmp_path, nombre="k1", page_size=1024) as sf:
+        sf.bulk_load(rec(k) for k in range(20_000))
+        assert sf.overflow_cap == (sf._capacity // 2) * math.ceil(math.log2(sf.page_count))
+
+    with abrir(tmp_path, nombre="k2", page_size=1024) as sf:
+        sf.bulk_load(rec(k) for k in range(200))
+        chico = sf.overflow_cap
+    with abrir(tmp_path, nombre="k3", page_size=1024) as sf:
+        sf.bulk_load(rec(k) for k in range(20_000))
+        assert sf.overflow_cap > chico
+
+
+def test_el_cap_es_valido_con_archivo_vacio_o_de_una_pagina(tmp_path):
+    with abrir(tmp_path, nombre="k4") as sf:
+        assert sf.overflow_cap >= 1
+        sf.insert(rec(1))
+        assert sf.overflow_cap >= 1
+
+
+def test_no_reorganiza_por_debajo_del_cap(tmp_path):
+    with abrir(tmp_path, nombre="k5", page_size=1024, fill_factor=1.0) as sf:
+        sf.bulk_load(rec(k) for k in range(0, 20_000, 10))
+        paginas = sf.page_count
+        for k in range(1, 1 + sf.overflow_cap // 2):
+            if k % 10:
+                sf.insert(rec(k))
+        assert sf.n_overflow > 0, "deberia haber overflow acumulado"
+        assert sf.page_count == paginas, "no debio reorganizar todavia"
+
+
+def test_reorganiza_al_superar_el_cap(tmp_path):
+    with abrir(tmp_path, nombre="k6", page_size=1024, fill_factor=1.0) as sf:
+        sf.bulk_load(rec(k) for k in range(0, 40_000, 10))
+        cap_inicial = sf.overflow_cap
+        insertadas, pico, hubo_reorg = [], 0, False
+        k = 1
+        while len(insertadas) < cap_inicial * 3:
+            if k % 10:
+                sf.insert(rec(k))
+                insertadas.append(k)
+                if sf.n_overflow < pico:
+                    hubo_reorg = True
+                pico = max(pico, sf.n_overflow)
+            k += 1
+        assert hubo_reorg, "debio dispararse al menos una reorganizacion automatica"
+        assert pico <= cap_inicial + 1, f"el overflow llego a {pico}, cap {cap_inicial}"
+        for j in insertadas:
+            assert sf.search(j) == rec(j), f"la reorganizacion perdio {j}"
+
+
+def test_sin_auto_reorganize_el_overflow_crece_sin_limite(tmp_path):
+    """El Experimento 1 compara el Sequential File con y sin reorganizacion."""
+    with abrir(
+        tmp_path, nombre="k8", page_size=1024, fill_factor=1.0, auto_reorganize=False
+    ) as sf:
+        sf.bulk_load(rec(k) for k in range(0, 40_000, 10))
+        cap = sf.overflow_cap
+        k = 1
+        while sf.n_overflow <= cap + 50:
+            if k % 10:
+                sf.insert(rec(k))
+            k += 1
+        assert sf.n_overflow > cap, "sin auto_reorganize nada debe frenar el crecimiento"
+
+
+def test_la_busqueda_queda_acotada_bajo_insercion_monotona_sostenida(tmp_path):
+    """El peor caso del Sequential File: claves siempre crecientes.
+
+    Sin cap, todas las inserciones caen en la ultima pagina y su cadena crece
+    sin limite. Con K = C*log2(P), la busqueda queda acotada por 2*log2(P).
+    """
+    with abrir(tmp_path, nombre="k7", page_size=1024, fill_factor=1.0) as sf:
+        N = 20_000
+        sf.bulk_load(rec(k) for k in range(N))
+        for k in range(N, N + 4_000):
+            sf.insert(rec(k))
+        cota = 2 * math.ceil(math.log2(sf.page_count))
+        for k in range(N + 3_900, N + 4_000):
+            sf.counter.reset()
+            assert sf.search(k) == rec(k)
+            assert sf.counter.disk_reads <= cota, (
+                f"clave {k}: {sf.counter.disk_reads} lecturas > cota {cota}"
+            )

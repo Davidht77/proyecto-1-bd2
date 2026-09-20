@@ -72,6 +72,7 @@ class SequentialFile:
         page_size: int = 4096,
         fill_factor: float = 0.75,
         cache_size: int = 0,
+        auto_reorganize: bool = True,
     ):
         if schema.pk_column.type not in (ColumnType.INT, ColumnType.FLOAT):
             raise UnsupportedKeyType(
@@ -86,6 +87,9 @@ class SequentialFile:
         self.page_size = page_size
         self.fill_factor = fill_factor
         self.cache_size = cache_size
+        # El Experimento 1 del enunciado compara el Sequential File "con y sin
+        # reorganizacion", asi que la politica tiene que ser conmutable.
+        self.auto_reorganize = auto_reorganize
 
         # Un unico contador compartido: si cada area llevara el suyo, el
         # desglose de I/O por consulta saldria partido en dos.
@@ -503,50 +507,66 @@ class SequentialFile:
         """Fraccion de registros que viven en el area de overflow."""
         return self.n_overflow / max(1, self.n_records)
 
-    def _should_reorganize(self) -> bool:
-        """DECISION ABIERTA 1: cuando dispara la reorganizacion automatica.
+    @property
+    def overflow_cap(self) -> int:
+        """Limite maximo K de registros en el area de overflow.
 
-        Datos medidos sobre 100k registros, B=4096, 3000 inserciones posteriores:
+        La clase 04 (Sequential File, "estrategia del espacio extra") fija que
+        debe existir un limite maximo de K registros en el espacio adicional.
+        Aqui K se deriva del modelo de costos en vez de elegirse a dedo.
 
-            estado                     lecturas por busqueda
-            recien reorganizado                 11.0
-            3% en overflow (disperso)           40.5
-            3% en overflow (monotono)           88.9
+        El costo de una busqueda es:
 
-        Y una reorganizacion completa de 120k registros cuesta ~2.3k lecturas
-        + 4.3k escrituras (~1.8 s).
+            log2(P)          pasos de la binaria sobre el area principal
+          + k_p              paginas recorridas de la cadena de overflow
 
-        Opciones:
-          A) ratio:   return self.overflow_ratio > 0.20
-          B) cadena:  llevar la longitud maxima de cadena y comparar con un tope
-          C) manual:  return False  (actual; solo POST /api/tables/reorganize)
+        Para que el segundo termino no domine al primero se exige que, aun en
+        el peor reparto (toda la cadena colgando de una sola pagina), el numero
+        de paginas de overflow no supere los pasos de la binaria:
 
-        Trade-off: un umbral bajo mantiene las busquedas cerca de log2(P) pero
-        paga reescrituras completas frecuentes; uno alto amortiza ese costo pero
-        deja degradar las busquedas. Ojo con el efecto secundario: si el umbral
-        es muy bajo, el Experimento 1 (costo de insercion masiva) va a medir
-        sobre todo reorganizaciones, no inserciones.
+            K / C <= log2(P)   =>   K = C * ceil(log2(P))
 
-        TODO: elegir politica e implementarla.
+        Eso acota la busqueda a 2*log2(P) en el peor caso, que sigue siendo del
+        mismo orden que el D*log2(M) de la tabla de costos de la clase.
+
+        El factor 1/2 sale de la politica de split: _split_overflow parte la
+        pagina llena en dos mitades, asi que las paginas de la cadena quedan
+        entre el 50% y el 100% ocupadas. K registros ocupan hasta 2K/C paginas,
+        no K/C, y sin ese factor la cota de busqueda se viola.
+
+        Un umbral por *ratio* seria incorrecto: el costo de busqueda depende de
+        la longitud absoluta de la cadena, no de su proporcion sobre el total.
+        Con 500k registros, un 20% serian 100k registros en overflow.
         """
-        return False
+        P = max(2, self.page_count)
+        return max(1, (self._capacity // 2) * math.ceil(math.log2(P)))
+
+    def _should_reorganize(self) -> bool:
+        """Reorganiza cuando el area de overflow supera su limite K.
+
+        Costo amortizado: una reorganizacion cuesta P+O lecturas y P'
+        escrituras, repartidas entre las K inserciones que la provocaron.
+        """
+        return self.auto_reorganize and self.n_overflow > self.overflow_cap
 
     def _page_budget(self, indice_pagina: int, total_paginas: int) -> int:
-        """DECISION ABIERTA 2: cuantos registros pone reorganize en cada pagina.
+        """Cuantos registros pone reorganize en cada pagina: uniforme.
 
-        Actualmente es uniforme: floor(capacity * fill_factor), el 75% que pide
-        el enunciado. Con capacity=75 son 56 registros y 19 slots libres por
-        pagina, que absorben las siguientes ~19 inserciones de ese rango sin
+        floor(capacity * fill_factor), el 70-80% que fija el enunciado en 3.2.2.
+        Con capacity=75 y fill_factor=0.75 son 56 registros y 19 slots libres
+        por pagina, que absorben las siguientes ~19 inserciones de ese rango sin
         tocar overflow.
 
-        Alternativa a considerar: si las claves crecen de forma monotona (ids
-        autoincrementales, timestamps), todas las inserciones caen en la ULTIMA
-        pagina y las 19 holguras de las demas nunca se usan. Ahi conviene
-        llenar las primeras paginas al 80% y dejar la ultima mucho mas vacia.
-        La medicion de arriba muestra el costo de no hacerlo: 88.9 lecturas por
-        busqueda con claves monotonas frente a 40.5 con claves dispersas.
+        Se evaluo sesgar la distribucion (llenar las primeras paginas al 80% y
+        dejar la ultima mas vacia) porque con claves monotonas -- ids
+        autoincrementales, timestamps -- todas las inserciones caen en la ultima
+        pagina y las holguras de las demas nunca se usan. Se descarto: ni el
+        enunciado ni la clase contemplan una distribucion no uniforme, y el cap
+        K de overflow_cap ya acota ese peor caso. El sesgo solo cambiaria cada
+        cuanto se dispara la reorganizacion, no la cota de busqueda.
 
-        TODO: decidir si se mantiene uniforme o se sesga hacia el final.
+        La firma recibe indice_pagina y total_paginas para que una politica no
+        uniforme se pueda implementar aqui sin tocar bulk_load ni reorganize.
         """
         return max(1, int(self._capacity * self.fill_factor))
 
