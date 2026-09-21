@@ -66,9 +66,57 @@ def test_drop_table(db):
         db.execute("SELECT * FROM empleados")
 
 
-def test_heap_no_implementado_con_mensaje_util(db):
-    with pytest.raises(NotImplementedFeature, match="USING SEQUENTIAL"):
-        db.execute("CREATE TABLE t (id INT) USING HEAP")
+def test_create_table_heap(db):
+    db.execute("CREATE TABLE libre (id INT PRIMARY KEY, v CHAR(10)) USING HEAP")
+    info = db.catalog.describe("libre")
+    assert info.engine == "HEAP"
+    assert info.n_overflow == 0  # el Heap File no tiene area de overflow
+
+
+def test_el_catalogo_reabre_una_tabla_heap(db, tmp_path):
+    """El archivo heap tambien debe ser autodescriptivo: su esquema vive en la
+    pagina 0, como el del Sequential File."""
+    db.execute("CREATE TABLE libre (id INT PRIMARY KEY, v CHAR(10)) USING HEAP")
+    for k in range(5):
+        db.execute(f"INSERT INTO libre VALUES ({k}, 'v{k}')")
+    db.catalog.close_all()
+
+    otro = Catalog(str(tmp_path / "data"), page_size=1024)
+    info = otro.describe("libre")
+    assert info.n_records == 5
+    assert [c.name for c in info.schema.columns] == ["id", "v"]
+    otro.close_all()
+
+
+def test_el_heap_no_tiene_indice_implicito(db):
+    db.execute("CREATE TABLE libre (id INT PRIMARY KEY, v CHAR(10)) USING HEAP")
+    db.execute("CREATE TABLE ord (id INT PRIMARY KEY, v CHAR(10)) USING SEQUENTIAL")
+    assert db.catalog.indexes_of("libre") == []
+    assert db.catalog.indexes_of("ord")[0]["kind"] == "SEQUENTIAL"
+
+
+def test_la_igualdad_sobre_un_heap_sigue_siendo_full_scan(db):
+    """Sin orden fisico no hay busqueda binaria posible: es el argumento
+    central del Experimento 2."""
+    db.execute("CREATE TABLE libre (id INT PRIMARY KEY, v CHAR(10)) USING HEAP")
+    for k in range(300):
+        db.execute(f"INSERT INTO libre VALUES ({k}, 'v{k}')")
+    r = db.execute("SELECT * FROM libre WHERE id = 250")
+    assert r.plan.access == "SeqScan"
+    assert "Heap File" in r.plan.reason
+    assert r.rows == [[250, "v250"]]
+
+
+def test_el_heap_lee_mas_bloques_que_el_sequential_en_igualdad(db):
+    for motor in ("HEAP", "SEQUENTIAL"):
+        db.execute(f"CREATE TABLE t{motor} (id INT PRIMARY KEY, v CHAR(10)) USING {motor}")
+        for k in range(400):
+            db.execute(f"INSERT INTO t{motor} VALUES ({k}, 'v{k}')")
+    heap = db.execute("SELECT * FROM tHEAP WHERE id = 399")
+    seq = db.execute("SELECT * FROM tSEQUENTIAL WHERE id = 399")
+    assert heap.plan.access == "SeqScan"
+    assert seq.plan.access == "BinarySearch"
+    assert heap.disk_reads > seq.disk_reads
 
 
 def test_create_index_no_implementado(db):

@@ -41,8 +41,8 @@ def test_health_declara_que_falta(client):
     r = client.get("/api/health")
     assert r.status_code == 200
     impl = r.json()["implemented"]
-    assert impl["storage"] and impl["sequential_file"]
-    assert not impl["heap_file"] and not impl["btree"] and not impl["hash"]
+    assert impl["storage"] and impl["sequential_file"] and impl["heap_file"]
+    assert not impl["btree"] and not impl["hash"]
 
 
 # ------------------------------------------------------------------- query
@@ -86,9 +86,17 @@ def test_funcionalidad_pendiente_es_501(client):
     assert "árbol B+" in r.json()["detail"]["detail"]
 
 
-def test_heap_es_501(client):
-    r = sql(client, "CREATE TABLE t (id INT) USING HEAP")
-    assert r.status_code == 501
+def test_heap_funciona_y_se_lista(client):
+    assert sql(client, "CREATE TABLE libre (id INT PRIMARY KEY, v CHAR(10)) USING HEAP").status_code == 200
+    for k in range(10):
+        sql(client, f"INSERT INTO libre VALUES ({k}, 'v{k}')")
+    t = next(t for t in client.get("/api/tables").json()["tables"] if t["name"] == "libre")
+    assert t["engine"] == "HEAP"
+    assert t["n_records"] == 10
+    assert t["indexes"] == []  # sin orden fisico no hay indice implicito
+    body = sql(client, "SELECT * FROM libre WHERE id = 7").json()
+    assert body["plan"]["access"] == "SeqScan"
+    assert body["rows"] == [[7, "v7"]]
 
 
 def test_max_rows_se_respeta(client):
@@ -214,7 +222,27 @@ def test_seed_insert_si_usa_la_ruta_normal(client):
 def test_benchmarks_declara_lo_que_falta(client):
     r = client.post("/api/benchmarks/run")
     assert r.status_code == 501
-    assert set(r.json()["detail"]["missing"]) == {"heap_file", "btree", "hash"}
+    assert set(r.json()["detail"]["missing"]) == {"btree", "hash"}
+
+
+def test_reorganizar_un_heap_es_409(client):
+    """Reorganizar es una operacion del Sequential File; en un Heap no aplica."""
+    sql(client, "CREATE TABLE libre (id INT PRIMARY KEY, v CHAR(10)) USING HEAP")
+    r = client.post("/api/tables/libre/reorganize")
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "no_aplica"
+
+
+def test_inspeccion_de_paginas_de_un_heap(client):
+    sql(client, "CREATE TABLE libre (id INT PRIMARY KEY, v CHAR(10)) USING HEAP")
+    for k in range(60):
+        sql(client, f"INSERT INTO libre VALUES ({k}, 'v{k}')")
+    body = client.get("/api/tables/libre/pages").json()
+    assert body["engine"] == "HEAP"
+    assert body["total_pages"] >= 1
+    assert body["overflow_records"] == 0
+    assert all(p["low_key"] is None for p in body["pages"])
+    assert all(p["overflow_chain"] == [] for p in body["pages"])
 
 
 def test_inspeccion_de_indice_declara_lo_que_falta(client):

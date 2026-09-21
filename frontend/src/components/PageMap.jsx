@@ -34,6 +34,7 @@ export default function PageMap({ data, loading }) {
   // Las cifras se reportan sobre la ventana cargada, no sobre el total, porque
   // solo se leyeron las cabeceras de estas páginas. El overflow global sí viene
   // del contador del archivo.
+  const heap = data.engine === 'HEAP'
   const visibles = data.pages.length
   const parcial = visibles < data.total_pages
   const conCadena = data.pages.filter((p) => p.overflow_chain.length).length
@@ -50,7 +51,7 @@ export default function PageMap({ data, loading }) {
               `página ${p.logical_index} (bloque físico ${p.page_id})\n` +
               `${p.record_count} de ${p.capacity} registros · ${p.fill_pct}%\n` +
               `claves ${p.first_key ?? '—'} … ${p.last_key ?? '—'}\n` +
-              `rango desde ${p.low_key === null ? '−∞' : p.low_key}` +
+              (p.low_key === null ? '' : `rango desde ${p.low_key}`) +
               (p.overflow_chain.length
                 ? `\noverflow: ${p.overflow_chain.length} página(s), ` +
                   `${p.overflow_chain.reduce((a, o) => a + o.record_count, 0)} registros`
@@ -83,14 +84,18 @@ export default function PageMap({ data, loading }) {
           {ocupacion.toFixed(0)}% de ocupación media
           {parcial ? ' en las páginas dibujadas' : ''}
         </span>
+        {heap ? (
+          <span>Un Heap File no mantiene orden ni área de overflow.</span>
+        ) : (
+          <span>
+            <i className="o" />
+            {data.overflow_records.toLocaleString('es')} registros en overflow
+            {conCadena > 0 && `, ${conCadena} de estas páginas con cadena`}
+          </span>
+        )}
         <span>
-          <i className="o" />
-          {data.overflow_records.toLocaleString('es')} registros en overflow
-          {conCadena > 0 && `, ${conCadena} de estas páginas con cadena`}
-        </span>
-        <span>
-          bloque de {data.page_size / 1024} KB · {data.capacity_per_page} registros por página ·
-          reorganiza al superar {data.overflow_cap.toLocaleString('es')}
+          bloque de {data.page_size / 1024} KB · {data.capacity_per_page} registros por página
+          {!heap && ` · reorganiza al superar ${data.overflow_cap.toLocaleString('es')}`}
         </span>
       </div>
     </div>

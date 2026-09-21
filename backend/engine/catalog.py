@@ -17,14 +17,16 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from backend.engine.errors import (
-    NotImplementedFeature,
-    TableAlreadyExists,
-    TableNotFound,
-)
+from backend.engine.errors import TableAlreadyExists, TableNotFound
 from backend.storage.pager import peek_header
 from backend.storage.schema import Schema
+from backend.structures.heap_file import HeapFile
 from backend.structures.sequential_file import SequentialFile
+
+# Ambas organizaciones exponen la misma superficie: insert, search, delete,
+# scan, range_search, bulk_load, flush y close. El motor las trata por igual;
+# lo unico exclusivo del Sequential File es reorganize() y su overflow.
+ENGINE_CLASS = {"SEQUENTIAL": SequentialFile, "HEAP": HeapFile}
 
 ENGINE_SUFFIX = {"SEQUENTIAL": ".seq", "HEAP": ".heap"}
 SUFFIX_ENGINE = {v: k for k, v in ENGINE_SUFFIX.items()}
@@ -93,16 +95,10 @@ class Catalog:
     def create_table(self, table: str, schema: Schema, engine: str) -> None:
         if self.exists(table):
             raise TableAlreadyExists(f"la tabla «{table}» ya existe")
-        if engine == "HEAP":
-            raise NotImplementedFeature(
-                "USING HEAP todavía no está implementado. El Heap File es parte "
-                "del trabajo pendiente del equipo; por ahora usa USING SEQUENTIAL."
-            )
-        sf = SequentialFile(
-            self._base(table), schema,
-            page_size=self.page_size, cache_size=self.cache_size,
-        )
-        sf.close()
+        cls = ENGINE_CLASS[engine]
+        f = cls(self._base(table), schema,
+                page_size=self.page_size, cache_size=self.cache_size)
+        f.close()
 
     def drop_table(self, table: str) -> None:
         engine = self._engine_of(table)
@@ -117,27 +113,27 @@ class Catalog:
 
     # ------------------------------------------------------------- acceso
 
-    def open_table(self, table: str) -> SequentialFile:
-        if table in self._open:
-            return self._open[table]
+    def engine_of(self, table: str) -> str:
         engine = self._engine_of(table)
         if engine is None:
             raise TableNotFound(f"la tabla «{table}» no existe")
-        if engine == "HEAP":
-            raise NotImplementedFeature(
-                f"la tabla «{table}» usa Heap File, que todavía no está implementado"
-            )
+        return engine
+
+    def open_table(self, table: str):
+        if table in self._open:
+            return self._open[table]
+        engine = self.engine_of(table)
 
         # El esquema y el page_size se leen de la pagina 0: el archivo es
         # autodescriptivo, asi que una tabla creada con otro tamano de bloque
         # se reabre correctamente sin metadatos externos.
-        header = peek_header(f"{self._base(table)}.seq.dat")
-        sf = SequentialFile(
+        header = peek_header(f"{self._base(table)}{ENGINE_SUFFIX[engine]}.dat")
+        f = ENGINE_CLASS[engine](
             self._base(table), header["schema"],
             page_size=header["page_size"], cache_size=self.cache_size,
         )
-        self._open[table] = sf
-        return sf
+        self._open[table] = f
+        return f
 
     def close_table(self, table: str) -> None:
         sf = self._open.pop(table, None)
@@ -163,7 +159,7 @@ class Catalog:
         engine = self._engine_of(table)
         if engine is None:
             raise TableNotFound(f"la tabla «{table}» no existe")
-        sf = self.open_table(table)
+        f = self.open_table(table)
         suffix = ENGINE_SUFFIX[engine]
         size = sum(
             (self.data_dir / f"{table}{suffix}{ext}").stat().st_size
@@ -173,12 +169,14 @@ class Catalog:
         return TableInfo(
             name=table,
             engine=engine,
-            schema=sf.schema,
-            n_records=sf.n_records,
-            n_overflow=sf.n_overflow,
-            page_count=sf.page_count,
-            page_size=sf.page_size,
-            record_size=sf.schema.record_size,
+            schema=f.schema,
+            n_records=f.n_records,
+            # El Heap File no tiene area de overflow: es un concepto exclusivo
+            # del Sequential File.
+            n_overflow=getattr(f, "n_overflow", 0),
+            page_count=f.page_count,
+            page_size=f.page_size,
+            record_size=f.schema.record_size,
             size_bytes=size,
             indexes=self.indexes_of(table),
         )
@@ -186,18 +184,18 @@ class Catalog:
     def indexes_of(self, table: str) -> list[dict]:
         """Indices secundarios de una tabla.
 
-        Siempre devuelve el indice primario implicito (la clave sobre la que el
-        Sequential File hace busqueda binaria). Los BTREE y HASH apareceran aqui
-        cuando se implementen.
+        El Sequential File tiene un indice primario implicito: la ordenacion
+        fisica por clave, sobre la que hace busqueda binaria. El Heap File no
+        tiene ninguno, y por eso toda consulta sobre el es un full scan.
+        Los BTREE y HASH apareceran aqui cuando se implementen.
         """
-        engine = self._engine_of(table)
-        if engine != "SEQUENTIAL":
+        if self._engine_of(table) != "SEQUENTIAL":
             return []
-        sf = self.open_table(table)
+        f = self.open_table(table)
         return [
             {
                 "name": f"pk_{table}",
-                "column": sf.schema.pk_column.name,
+                "column": f.schema.pk_column.name,
                 "kind": "SEQUENTIAL",
                 "implicit": True,
             }

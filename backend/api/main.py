@@ -114,7 +114,7 @@ def health() -> dict:
         "implemented": {
             "storage": True,
             "sequential_file": True,
-            "heap_file": False,
+            "heap_file": True,
             "btree": False,
             "hash": False,
         },
@@ -150,6 +150,17 @@ def describe_table(table: str) -> dict:
 @app.post("/api/tables/{table}/reorganize")
 def reorganize(table: str) -> dict:
     try:
+        if catalog.engine_of(table) != "SEQUENTIAL":
+            raise HTTPException(
+                409,
+                {
+                    "error": "no_aplica",
+                    "detail": f"«{table}» es un Heap File. La reorganización es una "
+                    "operación del Sequential File: fusiona su área de overflow y "
+                    "reescribe el archivo principal ordenado. Un Heap File no "
+                    "mantiene orden, así que no hay nada que reorganizar.",
+                },
+            )
         sf = catalog.open_table(table)
         antes = {"pages": sf.page_count, "overflow_records": sf.n_overflow}
         stats = sf.reorganize()
@@ -160,6 +171,8 @@ def reorganize(table: str) -> dict:
             "after": {"pages": sf.page_count, "overflow_records": sf.n_overflow},
             "stats": stats.as_dict(),
         }
+    except HTTPException:
+        raise
     except EngineError as exc:
         raise _http(exc) from exc
 
@@ -177,12 +190,17 @@ def inspect_pages(
     sin abrir un visor hexadecimal.
     """
     try:
-        sf = catalog.open_table(table)
+        engine = catalog.engine_of(table)
+        f = catalog.open_table(table)
+        sf = f
+        # El Heap File numera sus paginas igual (la 0 es la cabecera) pero no
+        # tiene low_key ni cadenas de overflow.
+        leer = f._read_main if engine == "SEQUENTIAL" else f._read_page
         paginas = []
-        for p in range(offset, min(offset + limit, sf.page_count)):
-            page = sf._read_main(p)
+        for p in range(offset, min(offset + limit, f.page_count)):
+            page = leer(p)
             cadena = []
-            pid = page.aux_page_id
+            pid = page.aux_page_id if engine == "SEQUENTIAL" else NULL_PAGE
             while pid != NULL_PAGE:
                 ov = sf.ovf.read_page(pid)
                 cadena.append({
@@ -192,7 +210,7 @@ def inspect_pages(
                     "next_page_id": None if ov.next_page_id == NULL_PAGE else ov.next_page_id,
                 })
                 pid = ov.next_page_id
-            low = page.get_low_key(sf.schema)
+            low = page.get_low_key(f.schema) if engine == "SEQUENTIAL" else None
             paginas.append({
                 "logical_index": p,
                 "page_id": page.page_id,
@@ -200,18 +218,19 @@ def inspect_pages(
                 "record_count": page.record_count,
                 "capacity": page.capacity,
                 "fill_pct": round(100 * page.record_count / page.capacity, 1),
-                "low_key": None if low == float("-inf") else low,
-                "first_key": page.first_key(sf.schema),
-                "last_key": page.last_key(sf.schema),
+                "low_key": None if low is None or low == float("-inf") else low,
+                "first_key": page.first_key(f.schema),
+                "last_key": page.last_key(f.schema),
                 "overflow_chain": cadena,
             })
         return {
             "table": table,
-            "page_size": sf.page_size,
-            "total_pages": sf.page_count,
-            "capacity_per_page": sf._capacity,
-            "overflow_cap": sf.overflow_cap,
-            "overflow_records": sf.n_overflow,
+            "engine": engine,
+            "page_size": f.page_size,
+            "total_pages": f.page_count,
+            "capacity_per_page": f._capacity,
+            "overflow_cap": getattr(f, "overflow_cap", 0),
+            "overflow_records": getattr(f, "n_overflow", 0),
             "offset": offset,
             "limit": limit,
             "pages": paginas,
@@ -277,7 +296,7 @@ def seed(table: str, req: SeedRequest) -> dict:
             },
             "state": {
                 "n_records": sf.n_records,
-                "n_overflow": sf.n_overflow,
+                "n_overflow": getattr(sf, "n_overflow", 0),
                 "pages": sf.page_count,
             },
         }
@@ -301,10 +320,11 @@ def run_benchmarks() -> dict:
         501,
         {
             "error": "no_implementado",
-            "detail": "La suite de benchmarks necesita Heap File, Arbol B+ y Hash "
-            "Dinamico para comparar. Mientras tanto, usa POST /api/tables/{t}/seed "
-            "y POST /api/query, que ya reportan I/O y latencia por operacion.",
-            "missing": ["heap_file", "btree", "hash"],
+            "detail": "La suite de benchmarks necesita el árbol B+ y el hashing "
+            "dinámico para completar la comparativa de los 4 experimentos. "
+            "Mientras tanto, usa POST /api/tables/{t}/seed y POST /api/query, que "
+            "ya reportan I/O y latencia por operación para Heap y Sequential.",
+            "missing": ["btree", "hash"],
         },
     )
 

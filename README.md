@@ -33,8 +33,8 @@ DELETE FROM empleados WHERE id = 101;
 DROP TABLE empleados;
 ```
 
-`USING HEAP` y `CREATE INDEX ... USING BTREE|HASH` se parsean, pero devuelven 501: esas
-estructuras son el trabajo pendiente del equipo.
+`USING HEAP` y `USING SEQUENTIAL` funcionan. `CREATE INDEX ... USING BTREE|HASH` se
+parsea, pero devuelve 501: esos índices son el trabajo pendiente del equipo.
 
 ## API REST
 
@@ -47,7 +47,7 @@ estructuras son el trabajo pendiente del equipo.
 | `GET` | `/api/tables/{t}/pages` | funcionando — inspección de páginas físicas |
 | `POST` | `/api/tables/{t}/seed` | funcionando — carga de datos sintéticos |
 | `GET` | `/api/health` | funcionando |
-| `POST` | `/api/benchmarks/run` | **501** — necesita Heap, B+ y Hash |
+| `POST` | `/api/benchmarks/run` | **501** — necesita B+ y Hash |
 | `GET` | `/api/tables/{t}/index/{n}` | **501** — necesita B+ o Hash |
 
 Documentación interactiva en `/docs`.
@@ -69,7 +69,7 @@ Documentación interactiva en `/docs`.
 | Módulo | Responsabilidad | Estado |
 |---|---|---|
 | `sequential_file.py` | Área principal ordenada, overflow encadenado, reorganización | listo |
-| `heap_file.py` | Free-list o move-the-last, full scan | **pendiente** |
+| `heap_file.py` | Free-list y move-the-last, full scan | listo (luism) |
 
 ### `backend/index/` — índices
 
@@ -139,7 +139,6 @@ Detalle completo en `docs/superpowers/specs/` y `docs/superpowers/plans/`.
 
 ## Qué falta para cerrar el Proyecto 1
 
-- `HeapFile` en `backend/structures/heap_file.py`
 - `BPlusTree` en `backend/index/btree.py`
 - `ExtendibleHash` en `backend/index/hash.py`
 - Suite de los 4 experimentos (`POST /api/benchmarks/run`)

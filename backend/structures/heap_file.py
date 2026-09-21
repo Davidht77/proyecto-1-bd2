@@ -63,6 +63,10 @@ class HeapFile:
         self.pager = Pager(
             self._data_path,
             record_size=self.schema.record_size,
+            # El esquema se escribe en la pagina 0 para que el archivo sea
+            # autodescriptivo, igual que el Sequential File: el catalogo se
+            # reconstruye leyendo esa cabecera, sin metadatos externos.
+            schema=self.schema,
             page_size=self.page_size,
             cache_size=self.cache_size,
             counter=self.counter,

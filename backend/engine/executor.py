@@ -167,20 +167,27 @@ class Executor:
                 f"la tabla «{stmt.table}» tiene {len(sf.schema.columns)} columnas, "
                 f"se dieron {len(stmt.values)} valores"
             )
+        es_seq = self.catalog.engine_of(stmt.table) == "SEQUENTIAL"
         sf.counter.reset()
         paginas_antes = sf.page_count
         sf.insert(tuple(stmt.values))
         sf.flush()
-        reorganizo = sf.page_count != paginas_antes
 
         mensaje = "1 registro insertado."
-        if reorganizo:
+        if es_seq and sf.page_count != paginas_antes:
             mensaje += (
                 f" Se disparó una reorganización automática: el área de overflow "
                 f"superó su límite de {sf.overflow_cap} registros."
             )
+        razon = (
+            "Inserción en el área principal o, si la página está llena, en su "
+            "cadena de overflow."
+            if es_seq
+            else "Inserción en la primera página con espacio libre, localizada por "
+            "la free-list del archivo."
+        )
         return _ok(
-            Plan("Insert", stmt.table, "Inserción en el área principal o, si la página está llena, en su cadena de overflow."),
+            Plan("Insert", stmt.table, razon),
             message=mensaje,
             reads=sf.counter.disk_reads,
             writes=sf.counter.disk_writes,
@@ -269,15 +276,17 @@ class Executor:
         escritas para que quien los implemente solo tenga que conectarlos aqui.
         """
         P = max(1, sf.page_count)
+        engine = self.catalog.engine_of(table)
         indices = self.catalog.indexes_of(table)
         es_pk = where is not None and where.column.lower() == sf.schema.pk_column.name.lower()
+        base = {"pages": P, "engine": engine}
 
         if where is None:
             return Plan(
                 "SeqScan", table,
                 "Sin WHERE: hay que recorrer la tabla completa.",
                 estimated_reads=P,
-                detail={"pages": P, "engine": "SEQUENTIAL"},
+                detail=base,
             )
 
         hash_idx = next((i for i in indices if i["kind"] == "HASH" and i["column"].lower() == where.column.lower()), None)
@@ -289,27 +298,35 @@ class Executor:
             acceso = "IndexScan" if where.is_equality else "IndexRangeScan"
             return Plan(acceso, table, f"indice BTREE '{btree_idx['name']}'", None)
 
-        if es_pk and where.is_equality:
+        if engine == "SEQUENTIAL" and es_pk:
             import math
 
             h = math.ceil(math.log2(max(2, P)))
-            return Plan(
-                "BinarySearch", table,
-                f"Igualdad sobre la clave primaria de un Sequential File: "
-                f"búsqueda binaria sobre {P} páginas.",
-                estimated_reads=h,
-                detail={"pages": P, "engine": "SEQUENTIAL", "overflow_records": sf.n_overflow},
-            )
-        if es_pk:
-            import math
-
-            h = math.ceil(math.log2(max(2, P)))
+            detalle = {**base, "overflow_records": sf.n_overflow}
+            if where.is_equality:
+                return Plan(
+                    "BinarySearch", table,
+                    f"Igualdad sobre la clave primaria de un Sequential File: "
+                    f"búsqueda binaria sobre {P} páginas.",
+                    estimated_reads=h,
+                    detail=detalle,
+                )
             return Plan(
                 "BinaryRangeScan", table,
                 f"Rango sobre la clave primaria: búsqueda binaria hasta el límite "
                 f"inferior y avance secuencial por las {P} páginas del archivo.",
                 estimated_reads=h,
-                detail={"pages": P, "engine": "SEQUENTIAL", "overflow_records": sf.n_overflow},
+                detail=detalle,
+            )
+
+        if engine == "HEAP":
+            return Plan(
+                "SeqScan", table,
+                f"Un Heap File no mantiene orden físico, así que ni siquiera una "
+                f"igualdad sobre la clave primaria puede evitar el recorrido de "
+                f"las {P} páginas. Es el costo que un índice vendría a eliminar.",
+                estimated_reads=P,
+                detail=base,
             )
 
         return Plan(
@@ -317,7 +334,7 @@ class Executor:
             f"El WHERE filtra por «{where.column}», que no es la clave primaria "
             f"ni tiene índice: recorrido secuencial completo.",
             estimated_reads=P,
-            detail={"pages": P, "engine": "SEQUENTIAL"},
+            detail=base,
         )
 
     # ------------------------------------------------------------- ejecucion

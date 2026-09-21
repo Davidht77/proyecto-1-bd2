@@ -61,25 +61,29 @@ export default function TableExplorer({ tables, selected, onSelect, onReorganize
                   <div><span>páginas</span><b>{t.page_count}</b></div>
                   <div><span>registro</span><b>{t.record_size} B</b></div>
                   <div><span>bloque</span><b>{t.page_size / 1024} KB</b></div>
-                  <div className={t.n_overflow ? 'warn' : ''}>
-                    <span>overflow</span><b>{t.n_overflow}</b>
-                  </div>
+                  {t.engine === 'SEQUENTIAL' && (
+                    <div className={t.n_overflow ? 'warn' : ''}>
+                      <span>overflow</span><b>{t.n_overflow}</b>
+                    </div>
+                  )}
                   <div><span>en disco</span><b>{bytes(t.size_bytes)}</b></div>
                 </div>
 
                 <div className="row-actions">
-                  <button
-                    className="action"
-                    disabled={busy || !t.n_overflow}
-                    onClick={() => onReorganize(t.name)}
-                    title={
-                      t.n_overflow
-                        ? 'Fusiona el área de overflow y reescribe el archivo principal'
-                        : 'No hay nada en overflow que fusionar'
-                    }
-                  >
-                    Reorganizar
-                  </button>
+                  {t.engine === 'SEQUENTIAL' && (
+                    <button
+                      className="action"
+                      disabled={busy || !t.n_overflow}
+                      onClick={() => onReorganize(t.name)}
+                      title={
+                        t.n_overflow
+                          ? 'Fusiona el área de overflow y reescribe el archivo principal'
+                          : 'No hay nada en overflow que fusionar'
+                      }
+                    >
+                      Reorganizar
+                    </button>
+                  )}
                   <button className="action" disabled={busy} onClick={() => onSeed(t.name)}>
                     Cargar datos
                   </button>
