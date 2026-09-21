@@ -57,6 +57,48 @@ else:
             written += os.write(fd, data[written:])
 
 
+def peek_header(path: str) -> dict:
+    """Lee la cabecera de un archivo de datos sin abrir un Pager completo.
+
+    El archivo es autodescriptivo: page_size, record_size y el esquema viven en
+    su pagina 0. Eso permite que el catalogo se reconstruya escaneando el
+    directorio, sin un archivo de catalogo aparte que se pueda desincronizar.
+    """
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        raw = _pread_at(fd, 8192, 0)
+    finally:
+        os.close(fd)
+
+    if len(raw) < _FILE_HDR.size:
+        raise InvalidFileError(f"{path}: archivo truncado")
+    (magic, page_size, page_count, free_head, record_size,
+     n_cols, pk_index, user_a, user_b) = _FILE_HDR.unpack_from(raw, 0)
+    if magic != FILE_MAGIC:
+        raise InvalidFileError(f"{path}: magic invalido ({magic!r})")
+
+    schema = None
+    if n_cols:
+        off = _FILE_HDR.size
+        cols = []
+        for _ in range(n_cols):
+            name, type_code, length = _COL_HDR.unpack_from(raw, off)
+            off += _COL_HDR.size
+            cols.append(
+                Column(name.split(b"\x00", 1)[0].decode("utf-8"), ColumnType(type_code), length)
+            )
+        schema = Schema(cols, pk_index=pk_index)
+
+    return {
+        "page_size": page_size,
+        "page_count": page_count,
+        "record_size": record_size,
+        "schema": schema,
+        "user_a": user_a,
+        "user_b": user_b,
+    }
+
+
 class Pager:
     """Gestiona un archivo paginado: cabecera, free-list y transferencias de bloque.
 

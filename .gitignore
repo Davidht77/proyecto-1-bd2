@@ -8,3 +8,10 @@ data/*.ovf
 clase04.txt
 enunciado.txt
 docs/superpowers/
+
+# datos binarios generados por el motor
+data/
+
+# artefactos de desarrollo
+.playwright-mcp/
+*.png

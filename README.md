@@ -2,12 +2,55 @@
 
 Capa de memoria secundaria y organización **Sequential File**.
 
-## Ejecutar
+## Levantar el sistema
 
 ```bash
-pip install pytest
-python -m pytest -q
+pip install fastapi uvicorn pydantic pytest
+cd frontend && npm install && npm run build && cd ..
+python -m uvicorn backend.api.main:app --port 8000
 ```
+
+Abre <http://127.0.0.1:8000>. FastAPI sirve el bundle de React, así que es un solo
+proceso y una sola URL.
+
+Para desarrollar el frontend con recarga en caliente, en otra terminal:
+`cd frontend && npm run dev` (el dev server proxea `/api` al backend del 8000).
+
+Tests: `python -m pytest -q`
+
+Variables de entorno: `BD2_DATA_DIR` (por defecto `data`), `BD2_PAGE_SIZE` (4096) y
+`BD2_CACHE_SIZE` (0 = sin buffer pool, que es como deben correr los benchmarks).
+
+## SQL soportado
+
+```sql
+CREATE TABLE empleados (id INT PRIMARY KEY, nombre CHAR(30), salario FLOAT) USING SEQUENTIAL;
+INSERT INTO empleados VALUES (101, 'Ada Lovelace', 5200.0);
+SELECT * FROM empleados WHERE id = 101;                 -- búsqueda binaria
+SELECT * FROM empleados WHERE id >= 100 AND id <= 500;  -- recorrido por rango
+SELECT * FROM empleados WHERE nombre = 'Ada';           -- escaneo secuencial
+DELETE FROM empleados WHERE id = 101;
+DROP TABLE empleados;
+```
+
+`USING HEAP` y `CREATE INDEX ... USING BTREE|HASH` se parsean, pero devuelven 501: esas
+estructuras son el trabajo pendiente del equipo.
+
+## API REST
+
+| Método | Ruta | Estado |
+|---|---|---|
+| `POST` | `/api/query` | funcionando |
+| `GET` | `/api/tables` | funcionando |
+| `GET` | `/api/tables/{t}` | funcionando |
+| `POST` | `/api/tables/{t}/reorganize` | funcionando |
+| `GET` | `/api/tables/{t}/pages` | funcionando — inspección de páginas físicas |
+| `POST` | `/api/tables/{t}/seed` | funcionando — carga de datos sintéticos |
+| `GET` | `/api/health` | funcionando |
+| `POST` | `/api/benchmarks/run` | **501** — necesita Heap, B+ y Hash |
+| `GET` | `/api/tables/{t}/index/{n}` | **501** — necesita B+ o Hash |
+
+Documentación interactiva en `/docs`.
 
 ## Módulos
 
@@ -23,9 +66,32 @@ python -m pytest -q
 
 ### `backend/structures/` — organización de archivos
 
+| Módulo | Responsabilidad | Estado |
+|---|---|---|
+| `sequential_file.py` | Área principal ordenada, overflow encadenado, reorganización | listo |
+| `heap_file.py` | Free-list o move-the-last, full scan | **pendiente** |
+
+### `backend/index/` — índices
+
+| Módulo | Responsabilidad | Estado |
+|---|---|---|
+| `btree.py` | Árbol B+ multinivel en disco | **pendiente** |
+| `hash.py` | Extendible o Linear Hashing | **pendiente** |
+
+### `backend/engine/` — motor de consultas
+
 | Módulo | Responsabilidad |
 |---|---|
-| `sequential_file.py` | Área principal ordenada, overflow encadenado por página, reorganización |
+| `parser.py` | Parser SQL por descenso recursivo, sin librerías |
+| `catalog.py` | Catálogo reconstruido leyendo la página 0 de cada archivo |
+| `executor.py` | Planificador de ruta de acceso y ejecución con telemetría |
+| `errors.py` | Jerarquía de errores que la API mapea a códigos HTTP |
+
+### `frontend/` — cliente SQL
+
+React + Vite. Cuatro paneles: explorador de tablas, editor SQL, visor de resultados y
+plan de ejecución con métricas de I/O. Incluye un mapa de páginas físicas que dibuja la
+ocupación real de cada bloque y sus cadenas de overflow.
 
 ## Contrato con el resto del equipo
 
@@ -70,6 +136,18 @@ page = pg.read_page(page.page_id)       # counter.disk_reads  += 1
 | Buffer pool | Opcional, apagado por defecto | Benchmarks sin caché validan la teoría; la demo con caché va rápida |
 
 Detalle completo en `docs/superpowers/specs/` y `docs/superpowers/plans/`.
+
+## Qué falta para cerrar el Proyecto 1
+
+- `HeapFile` en `backend/structures/heap_file.py`
+- `BPlusTree` en `backend/index/btree.py`
+- `ExtendibleHash` en `backend/index/hash.py`
+- Suite de los 4 experimentos (`POST /api/benchmarks/run`)
+
+Cada archivo pendiente documenta sus requisitos del enunciado y qué le da ya la capa de
+almacenamiento. Para conectar un índice nuevo al motor basta con registrarlo en
+`Catalog.indexes_of()` e implementar su rama en `Executor._rows_for()`: el planificador
+ya elige `IndexScan` e `IndexRangeScan` en cuanto detecta el índice.
 
 ## Limitaciones conocidas
 
