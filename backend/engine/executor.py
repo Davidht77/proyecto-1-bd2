@@ -151,18 +151,23 @@ class Executor:
     def _create_index(self, stmt: CreateIndex) -> QueryResult:
         if not self.catalog.exists(stmt.table):
             raise TableNotFound(f"la tabla «{stmt.table}» no existe")
-        if stmt.kind != "HASH":
+        if stmt.kind not in ("HASH", "BTREE"):
             raise NotImplementedFeature(
-                f"CREATE INDEX ... USING {stmt.kind} todavía no está implementado. "
-                "El árbol B+ es trabajo pendiente del equipo. Mientras tanto, las "
-                "consultas de igualdad y de rango sobre la clave primaria de una "
-                "tabla SEQUENTIAL ya resuelven por búsqueda binaria, sin índice."
+                f"CREATE INDEX ... USING {stmt.kind} todavía no está implementado."
             )
         _validar_columna(self.catalog.open_table(stmt.table).schema, stmt.column, stmt.table)
         self.catalog.create_index(stmt.table, stmt.name, stmt.column, stmt.kind)
+        if stmt.kind == "HASH":
+            mensaje = f"Índice «{stmt.name}» creado sobre {stmt.table}({stmt.column}) usando HASH."
+        else:
+            tree = self.catalog.open_index(stmt.table, stmt.name)
+            mensaje = (
+                f"Índice «{stmt.name}» creado (BTREE) sobre {stmt.table}.{stmt.column}. "
+                f"Altura {tree.height}, fan-out {tree.fanout}."
+            )
         return _ok(
             Plan("DDL", stmt.table, f"CREATE INDEX USING {stmt.kind}"),
-            message=f"Índice «{stmt.name}» creado sobre {stmt.table}({stmt.column}) usando HASH.",
+            message=mensaje,
             writes=1,
         )
 
@@ -203,6 +208,13 @@ class Executor:
         )
 
     def _delete(self, stmt: Delete) -> QueryResult:
+        # NOTA: esto no mantiene los indices BTREE de la tabla. HeapFile
+        # borra con move-the-last (el ultimo registro del archivo hereda el
+        # RID del borrado) y SequentialFile puede desplazar overflow, asi
+        # que un borrado invalida RIDs de formas que un simple "quita esta
+        # clave del arbol" no repara. Falta una pasada de reindexado
+        # (o reconstruir los indices con Catalog.create_index) tras un
+        # DELETE si la tabla tiene indices BTREE activos.
         sf = self.catalog.open_table(stmt.table)
         if stmt.where is None:
             raise SQLRuntimeError(
@@ -306,15 +318,25 @@ class Executor:
             truncated=total > len(filas),
         )
 
+    def _row_at(self, sf, rid):
+        """Lee una fila de la tabla por su RID fisico (page_id, slot).
+
+        El RID que guarda el indice BTREE es el mismo (page_id, slot) que
+        usa la tabla, asi que basta con leer esa pagina directo por el
+        Pager de la tabla, sin pasar por scan()/logical numbering. El BTREE
+        solo indexa el area principal (ver Catalog.create_index), asi que
+        aqui alcanza con el pager del Heap File o el area main del
+        Sequential File.
+        """
+        page = sf.pager.read_page(rid.page_id) if hasattr(sf, "pager") else sf.main.read_page(rid.page_id)
+        if not page.is_occupied(rid.slot):
+            return None
+        return sf.schema.unpack(page.read_record(rid.slot))
+
     # ------------------------------------------------- planificador de acceso
 
     def _plan(self, sf, table: str, where: Condition | None, kind: str) -> Plan:
-        """Selecciona la ruta de acceso.
-
-        El orden de preferencia sigue el enunciado 3.4. Como todavia no hay
-        indices BTREE ni HASH, las dos primeras ramas no se alcanzan; quedan
-        escritas para que quien los implemente solo tenga que conectarlos aqui.
-        """
+        """Selecciona la ruta de acceso segun el enunciado 3.4."""
         P = max(1, sf.page_count)
         engine = self.catalog.engine_of(table)
         indices = self.catalog.indexes_of(table)
@@ -339,7 +361,19 @@ class Executor:
             )
         if btree_idx:
             acceso = "IndexScan" if where.is_equality else "IndexRangeScan"
-            return Plan(acceso, table, f"indice BTREE '{btree_idx['name']}'", None)
+            tree = self.catalog.open_index(table, btree_idx["name"])
+            razon = (
+                f"igualdad con indice BTREE '{btree_idx['name']}': {tree.height} "
+                f"transferencias (altura del arbol)"
+                if where.is_equality else
+                f"rango con indice BTREE '{btree_idx['name']}': desciende a la "
+                f"primera hoja ({tree.height} transferencias) y recorre next_leaf_id"
+            )
+            return Plan(
+                acceso, table, razon,
+                estimated_reads=tree.height if where.is_equality else None,
+                detail={**base, "index_name": btree_idx["name"], "index_height": tree.height, "fanout": tree.fanout},
+            )
 
         if engine == "SEQUENTIAL" and es_pk:
             import math
@@ -397,10 +431,42 @@ class Executor:
             return
 
         if plan.access in ("IndexScan", "IndexRangeScan"):
-            raise NotImplementedFeature(
-                "El planificador eligió un IndexScan, pero el árbol B+ todavía no "
-                "está implementado."
-            )
+            table = plan.table
+            index_name = plan.detail.get("index_name")
+            if index_name is None:
+                raise NotImplementedFeature(
+                    "El planificador eligió un IndexScan pero no hay un índice BTREE "
+                    "aplicable (falta el hashing dinámico para índices HASH)."
+                )
+            tree = self.catalog.open_index(table, index_name)
+            n = 0
+            if plan.access == "IndexScan":
+                rid = tree.search(where.lo)
+                if rid is not None:
+                    row = self._row_at(sf, rid)
+                    if row is not None:
+                        yield row
+                return
+            # IndexRangeScan
+            lo = where.lo if where.lo is not None else _MIN
+            hi = where.hi if where.hi is not None else _MAX
+            for rid in tree.range_search(lo, hi):
+                row = self._row_at(sf, rid)
+                if row is None:
+                    continue
+                col_idx = next(
+                    i for i, c in enumerate(sf.schema.columns) if c.name.lower() == where.column.lower()
+                )
+                v = row[col_idx]
+                if not where.lo_inclusive and v == where.lo:
+                    continue
+                if not where.hi_inclusive and v == where.hi:
+                    continue
+                yield row
+                n += 1
+                if limit is not None and n >= limit:
+                    return
+            return
 
         n = 0
         if plan.access == "BinarySearch":

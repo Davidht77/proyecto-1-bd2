@@ -115,7 +115,7 @@ def health() -> dict:
             "storage": True,
             "sequential_file": True,
             "heap_file": True,
-            "btree": False,
+            "btree": True,
             "hash": True,
         },
     }

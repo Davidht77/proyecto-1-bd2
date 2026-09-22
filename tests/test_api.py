@@ -37,12 +37,12 @@ def crear(client, n=0):
 # ------------------------------------------------------------------ health
 
 
-def test_health_declara_que_falta(client):
+def test_health_declara_lo_implementado(client):
     r = client.get("/api/health")
     assert r.status_code == 200
     impl = r.json()["implemented"]
-    assert impl["storage"] and impl["sequential_file"] and impl["heap_file"] and impl["hash"]
-    assert not impl["btree"]
+    assert impl["storage"] and impl["sequential_file"] and impl["heap_file"]
+    assert impl["hash"] and impl["btree"]
 
 
 # ------------------------------------------------------------------- query
@@ -78,12 +78,12 @@ def test_tabla_duplicada_es_409(client):
     assert r.status_code == 409
 
 
-def test_funcionalidad_pendiente_es_501(client):
-    crear(client)
+def test_create_index_btree_via_api(client):
+    crear(client, n=10)
     r = sql(client, "CREATE INDEX i ON emp (id) USING BTREE")
-    assert r.status_code == 501
-    assert r.json()["detail"]["error"] == "no_implementado"
-    assert "árbol B+" in r.json()["detail"]["detail"]
+    assert r.status_code == 200
+    r = sql(client, "SELECT * FROM emp WHERE id = 5")
+    assert r.json()["plan"]["access"] == "IndexScan"
 
 
 def test_heap_funciona_y_se_lista(client):

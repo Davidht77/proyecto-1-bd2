@@ -3,7 +3,6 @@ import pytest
 from backend.engine.catalog import Catalog
 from backend.engine.errors import (
     ColumnNotFound,
-    NotImplementedFeature,
     SQLRuntimeError,
     TableAlreadyExists,
     TableNotFound,
@@ -119,18 +118,28 @@ def test_el_heap_lee_mas_bloques_que_el_sequential_en_igualdad(db):
     assert heap.disk_reads > seq.disk_reads
 
 
-def test_create_index_no_implementado(db):
-    crear(db)
-    with pytest.raises(NotImplementedFeature, match="árbol B\\+"):
-        db.execute("CREATE INDEX i ON empleados (id) USING BTREE")
-
-
 def test_create_index_hash_habilita_index_scan(db):
     crear(db, n=10)
     db.execute("CREATE INDEX i ON empleados (id) USING HASH")
     r = db.execute("SELECT * FROM empleados WHERE id = 5")
     assert r.plan.access == "IndexScan"
     assert r.rows[0][0] == 5
+
+
+def test_create_index_btree_habilita_index_scan(db):
+    crear(db, n=10)
+    db.execute("CREATE INDEX i ON empleados (id) USING BTREE")
+    r = db.execute("SELECT * FROM empleados WHERE id = 5")
+    assert r.plan.access == "IndexScan"
+    assert r.rows[0][0] == 5
+
+
+def test_create_index_btree_habilita_index_range_scan(db):
+    crear(db, n=10)
+    db.execute("CREATE INDEX i ON empleados (id) USING BTREE")
+    r = db.execute("SELECT * FROM empleados WHERE id BETWEEN 3 AND 6")
+    assert r.plan.access == "IndexRangeScan"
+    assert [row[0] for row in r.rows] == [3, 4, 5, 6]
 
 
 def test_create_index_sobre_tabla_inexistente(db):
