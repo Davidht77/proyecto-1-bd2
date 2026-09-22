@@ -17,7 +17,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from backend.engine.errors import TableAlreadyExists, TableNotFound
+from backend.engine.errors import ColumnNotFound, NotImplementedFeature, TableAlreadyExists, TableNotFound
+from backend.index.hash import ExtendibleHash, RID as HashRID
 from backend.storage.pager import peek_header
 from backend.storage.schema import Schema
 from backend.structures.heap_file import HeapFile
@@ -75,6 +76,7 @@ class Catalog:
         self.page_size = page_size
         self.cache_size = cache_size
         self._open: dict[str, SequentialFile] = {}
+        self._open_indexes: dict[tuple[str, str], ExtendibleHash] = {}
 
     # ------------------------------------------------------------- rutas
 
@@ -110,6 +112,59 @@ class Catalog:
             path = self.data_dir / f"{table}{suffix}{ext}"
             if path.exists():
                 path.unlink()
+        for key in [k for k in self._open_indexes if k[0] == table]:
+            self.close_index(*key)
+        for path in list(self.data_dir.glob(f"{table}__*.hash.dir")) + list(self.data_dir.glob(f"{table}__*.hash.bkt")):
+            path.unlink()
+
+    # --------------------------------------------------------------- indices
+
+    def _index_base(self, table: str, index_name: str) -> str:
+        return str(self.data_dir / f"{table}__{index_name}")
+
+    def create_index(self, table: str, index_name: str, column: str, kind: str) -> None:
+        if kind != "HASH":
+            raise NotImplementedFeature(f"CREATE INDEX ... USING {kind} todavía no está implementado.")
+        base = self._index_base(table, index_name)
+        if Path(f"{base}.hash.dir").exists():
+            raise TableAlreadyExists(f"el índice «{index_name}» ya existe")
+
+        f = self.open_table(table)
+        col = next((c for c in f.schema.columns if c.name.lower() == column.lower()), None)
+        if col is None:
+            raise ColumnNotFound(f"la columna «{column}» no existe en «{table}»")
+        col_idx = f.schema.columns.index(col)
+
+        idx = ExtendibleHash(base, col, page_size=self.page_size, cache_size=self.cache_size)
+        for rid, row in f.scan_with_rid():
+            idx.insert(row[col_idx], HashRID.from_engine_rid(rid))
+        idx.flush()
+        self._open_indexes[(table, index_name)] = idx
+
+    def open_index(self, table: str, index_name: str) -> ExtendibleHash:
+        key = (table, index_name)
+        if key in self._open_indexes:
+            return self._open_indexes[key]
+        base = self._index_base(table, index_name)
+        header = peek_header(f"{base}.hash.dir")
+        idx = ExtendibleHash(base, header["schema"].columns[0], page_size=header["page_size"], cache_size=self.cache_size)
+        self._open_indexes[key] = idx
+        return idx
+
+    def close_index(self, table: str, index_name: str) -> None:
+        idx = self._open_indexes.pop((table, index_name), None)
+        if idx is not None:
+            idx.close()
+
+    def row_at(self, table: str, rid: HashRID) -> tuple | None:
+        f = self.open_table(table)
+        if self.engine_of(table) == "HEAP":
+            page = f.pager.read_page(rid.page_id)
+        else:
+            page = (f.main if rid.area == 0 else f.ovf).read_page(rid.page_id)
+        if not page.is_occupied(rid.slot):
+            return None
+        return f.schema.unpack(page.read_record(rid.slot))
 
     # ------------------------------------------------------------- acceso
 
@@ -143,6 +198,8 @@ class Catalog:
     def close_all(self) -> None:
         for table in list(self._open):
             self.close_table(table)
+        for key in list(self._open_indexes):
+            self.close_index(*key)
 
     # ------------------------------------------------------------- listado
 
@@ -187,19 +244,30 @@ class Catalog:
         El Sequential File tiene un indice primario implicito: la ordenacion
         fisica por clave, sobre la que hace busqueda binaria. El Heap File no
         tiene ninguno, y por eso toda consulta sobre el es un full scan.
-        Los BTREE y HASH apareceran aqui cuando se implementen.
+        Los BTREE apareceran aqui cuando se implementen. Los HASH se
+        descubren escaneando el directorio de datos: no hay archivo de
+        catalogo aparte, igual que con las tablas.
         """
-        if self._engine_of(table) != "SEQUENTIAL":
-            return []
-        f = self.open_table(table)
-        return [
-            {
+        indices = []
+        if self._engine_of(table) == "SEQUENTIAL":
+            f = self.open_table(table)
+            indices.append({
                 "name": f"pk_{table}",
                 "column": f.schema.pk_column.name,
                 "kind": "SEQUENTIAL",
                 "implicit": True,
-            }
-        ]
+            })
+        prefix = f"{table}__"
+        for path in self.data_dir.glob(f"{prefix}*.hash.dir"):
+            index_name = path.name[len(prefix) : -len(".hash.dir")]
+            header = peek_header(str(path))
+            indices.append({
+                "name": index_name,
+                "column": header["schema"].columns[0].name,
+                "kind": "HASH",
+                "implicit": False,
+            })
+        return indices
 
     def list_tables(self) -> list[TableInfo]:
         return [self.describe(t) for t in self.table_names()]

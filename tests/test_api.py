@@ -41,8 +41,8 @@ def test_health_declara_que_falta(client):
     r = client.get("/api/health")
     assert r.status_code == 200
     impl = r.json()["implemented"]
-    assert impl["storage"] and impl["sequential_file"] and impl["heap_file"]
-    assert not impl["btree"] and not impl["hash"]
+    assert impl["storage"] and impl["sequential_file"] and impl["heap_file"] and impl["hash"]
+    assert not impl["btree"]
 
 
 # ------------------------------------------------------------------- query

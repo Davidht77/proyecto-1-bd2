@@ -125,10 +125,12 @@ def test_create_index_no_implementado(db):
         db.execute("CREATE INDEX i ON empleados (id) USING BTREE")
 
 
-def test_create_index_hash_no_implementado(db):
-    crear(db)
-    with pytest.raises(NotImplementedFeature, match="hashing dinámico"):
-        db.execute("CREATE INDEX i ON empleados (id) USING HASH")
+def test_create_index_hash_habilita_index_scan(db):
+    crear(db, n=10)
+    db.execute("CREATE INDEX i ON empleados (id) USING HASH")
+    r = db.execute("SELECT * FROM empleados WHERE id = 5")
+    assert r.plan.access == "IndexScan"
+    assert r.rows[0][0] == 5
 
 
 def test_create_index_sobre_tabla_inexistente(db):

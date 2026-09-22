@@ -122,6 +122,13 @@ class HeapFile:
                     raw = page.read_record(slot)
                     yield self.schema.unpack(raw)
 
+    def scan_with_rid(self) -> Iterator[tuple[RID, tuple]]:
+        for p in range(self.page_count):
+            page = self._read_page(p)
+            for slot in range(self.capacity):
+                if page.is_occupied(slot):
+                    yield RID(page.page_id, slot), self.schema.unpack(page.read_record(slot))
+
     # ------------------------------------------------------------------ insercion
 
     def insert(self, record: tuple) -> RID:

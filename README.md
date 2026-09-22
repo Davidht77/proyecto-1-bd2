@@ -33,8 +33,10 @@ DELETE FROM empleados WHERE id = 101;
 DROP TABLE empleados;
 ```
 
-`USING HEAP` y `USING SEQUENTIAL` funcionan. `CREATE INDEX ... USING BTREE|HASH` se
-parsea, pero devuelve 501: esos índices son el trabajo pendiente del equipo.
+`USING HEAP` y `USING SEQUENTIAL` funcionan. `CREATE INDEX ... USING HASH` construye
+un Hashing Dinámico sobre disco y habilita `IndexScan` en el planificador.
+`CREATE INDEX ... USING BTREE` se parsea, pero devuelve 501: el árbol B+ sigue
+pendiente.
 
 ## API REST
 
@@ -47,8 +49,8 @@ parsea, pero devuelve 501: esos índices son el trabajo pendiente del equipo.
 | `GET` | `/api/tables/{t}/pages` | funcionando — inspección de páginas físicas |
 | `POST` | `/api/tables/{t}/seed` | funcionando — carga de datos sintéticos |
 | `GET` | `/api/health` | funcionando |
-| `POST` | `/api/benchmarks/run` | **501** — necesita B+ y Hash |
-| `GET` | `/api/tables/{t}/index/{n}` | **501** — necesita B+ o Hash |
+| `POST` | `/api/benchmarks/run` | **501** — necesita B+ (usa Heap/Sequential/Hash mientras tanto) |
+| `GET` | `/api/tables/{t}/index/{n}` | **501** — inspección de índice, aún no implementada |
 
 Documentación interactiva en `/docs`.
 
@@ -76,7 +78,7 @@ Documentación interactiva en `/docs`.
 | Módulo | Responsabilidad | Estado |
 |---|---|---|
 | `btree.py` | Árbol B+ multinivel en disco | **pendiente** |
-| `hash.py` | Extendible o Linear Hashing | **pendiente** |
+| `hash.py` | Extendible Hashing | listo (sebastian) |
 
 ### `backend/engine/` — motor de consultas
 
@@ -118,11 +120,15 @@ page = pg.read_page(page.page_id)       # counter.disk_reads  += 1
 - `page_capacity(page_size, record_size)` da el fan-out directamente, para la tabla del
   Experimento 4.
 
-### Para quien implemente el Hash Extensible
+### Hash Extensible
 
-- `pager.user_a` sirve como profundidad global; `page.aux_page_id` como profundidad
-  local del bucket.
-- `pager.free_page(id)` devuelve buckets vacíos a la free-list tras una fusión.
+Dos archivos por índice (`<tabla>__<indice>.hash.dir` y `.hash.bkt`), mismo
+patrón que el par `.seq.dat`/`.seq.ovf`. `pager.user_a` del archivo `.dir` es
+la profundidad global; `page.aux_page_id` de cada bucket es su profundidad
+local. Un bucket que no logra separarse al dividirse (claves muy repetidas)
+encadena overflow por `next_page_id` en vez de seguir duplicando el
+directorio. `Catalog.create_index`/`open_index` lo conectan al motor;
+`INSERT`/`DELETE` mantienen el índice al día.
 
 ## Decisiones de diseño
 
@@ -140,7 +146,6 @@ Detalle completo en `docs/superpowers/specs/` y `docs/superpowers/plans/`.
 ## Qué falta para cerrar el Proyecto 1
 
 - `BPlusTree` en `backend/index/btree.py`
-- `ExtendibleHash` en `backend/index/hash.py`
 - Suite de los 4 experimentos (`POST /api/benchmarks/run`)
 
 Cada archivo pendiente documenta sus requisitos del enunciado y qué le da ya la capa de

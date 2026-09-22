@@ -37,6 +37,7 @@ from backend.engine.parser import (
     Statement,
     parse,
 )
+from backend.index.hash import RID as HashRID
 from backend.storage.schema import Schema
 
 
@@ -150,12 +151,19 @@ class Executor:
     def _create_index(self, stmt: CreateIndex) -> QueryResult:
         if not self.catalog.exists(stmt.table):
             raise TableNotFound(f"la tabla «{stmt.table}» no existe")
-        raise NotImplementedFeature(
-            f"CREATE INDEX ... USING {stmt.kind} todavía no está implementado. "
-            f"El {'árbol B+' if stmt.kind == 'BTREE' else 'hashing dinámico'} es "
-            "parte del trabajo pendiente del equipo. Mientras tanto, las consultas "
-            "de igualdad y de rango sobre la clave primaria de una tabla SEQUENTIAL "
-            "ya resuelven por búsqueda binaria, sin necesidad de índice."
+        if stmt.kind != "HASH":
+            raise NotImplementedFeature(
+                f"CREATE INDEX ... USING {stmt.kind} todavía no está implementado. "
+                "El árbol B+ es trabajo pendiente del equipo. Mientras tanto, las "
+                "consultas de igualdad y de rango sobre la clave primaria de una "
+                "tabla SEQUENTIAL ya resuelven por búsqueda binaria, sin índice."
+            )
+        _validar_columna(self.catalog.open_table(stmt.table).schema, stmt.column, stmt.table)
+        self.catalog.create_index(stmt.table, stmt.name, stmt.column, stmt.kind)
+        return _ok(
+            Plan("DDL", stmt.table, f"CREATE INDEX USING {stmt.kind}"),
+            message=f"Índice «{stmt.name}» creado sobre {stmt.table}({stmt.column}) usando HASH.",
+            writes=1,
         )
 
     # ------------------------------------------------------------- DML
@@ -170,7 +178,8 @@ class Executor:
         es_seq = self.catalog.engine_of(stmt.table) == "SEQUENTIAL"
         sf.counter.reset()
         paginas_antes = sf.page_count
-        sf.insert(tuple(stmt.values))
+        rid = sf.insert(tuple(stmt.values))
+        self._index_on_insert(stmt.table, sf.schema, stmt.values, rid)
         sf.flush()
 
         mensaje = "1 registro insertado."
@@ -204,13 +213,27 @@ class Executor:
 
         sf.counter.reset()
         if plan.access == "BinarySearch":
-            borradas = 1 if sf.delete(stmt.where.lo) else 0
+            claves = [stmt.where.lo] if sf.search(stmt.where.lo) is not None else []
         else:
             claves = [
                 sf.schema.key_of(row)
-                for row in self._rows_for(sf, stmt.where, plan, limit=None)
+                for row in self._rows_for(sf, stmt.where, plan, limit=None, table=stmt.table)
             ]
-            borradas = sum(1 for k in claves if sf.delete(k))
+
+        indices_hash = self._hash_indexes_of(stmt.table)
+        borradas = 0
+        for k in claves:
+            row = sf.search(k)
+            rid = _rid_of(sf, k)
+            if row is None or rid is None:
+                continue
+            if sf.delete(k):
+                borradas += 1
+                hash_rid = HashRID.from_engine_rid(rid)
+                for info, col_idx in indices_hash:
+                    idx = self.catalog.open_index(stmt.table, info["name"])
+                    idx.delete(row[col_idx], rid=hash_rid)
+                    idx.flush()
         sf.flush()
 
         return _ok(
@@ -219,6 +242,23 @@ class Executor:
             reads=sf.counter.disk_reads,
             writes=sf.counter.disk_writes,
         )
+
+    def _hash_indexes_of(self, table: str) -> list[tuple[dict, int]]:
+        sf = self.catalog.open_table(table)
+        out = []
+        for info in self.catalog.indexes_of(table):
+            if info["kind"] != "HASH":
+                continue
+            col_idx = next(i for i, c in enumerate(sf.schema.columns) if c.name.lower() == info["column"].lower())
+            out.append((info, col_idx))
+        return out
+
+    def _index_on_insert(self, table: str, schema: Schema, values: list, rid) -> None:
+        hash_rid = HashRID.from_engine_rid(rid)
+        for info, col_idx in self._hash_indexes_of(table):
+            idx = self.catalog.open_index(table, info["name"])
+            idx.insert(values[col_idx], hash_rid)
+            idx.flush()
 
     # ------------------------------------------------------------- SELECT
 
@@ -248,7 +288,7 @@ class Executor:
         sf.counter.reset()
         filas: list[list[Any]] = []
         total = 0
-        for row in self._rows_for(sf, stmt.where, plan, limite):
+        for row in self._rows_for(sf, stmt.where, plan, limite, table=stmt.table):
             total += 1
             if len(filas) < max_rows:
                 filas.append([row[i] for i in proyeccion])
@@ -293,7 +333,10 @@ class Executor:
         btree_idx = next((i for i in indices if i["kind"] == "BTREE" and i["column"].lower() == where.column.lower()), None)
 
         if where.is_equality and hash_idx:
-            return Plan("IndexScan", table, f"igualdad con indice HASH '{hash_idx['name']}'", 1)
+            return Plan(
+                "IndexScan", table, f"igualdad con indice HASH '{hash_idx['name']}'", 1,
+                detail={**base, "kind": "HASH", "index_name": hash_idx["name"]},
+            )
         if btree_idx:
             acceso = "IndexScan" if where.is_equality else "IndexRangeScan"
             return Plan(acceso, table, f"indice BTREE '{btree_idx['name']}'", None)
@@ -339,11 +382,24 @@ class Executor:
 
     # ------------------------------------------------------------- ejecucion
 
-    def _rows_for(self, sf, where: Condition | None, plan: Plan, limit: int | None):
+    def _rows_for(self, sf, where: Condition | None, plan: Plan, limit: int | None, table: str | None = None):
+        if plan.access == "IndexScan" and plan.detail.get("kind") == "HASH":
+            idx = self.catalog.open_index(table, plan.detail["index_name"])
+            n = 0
+            for rid in idx.search(where.lo):
+                row = self.catalog.row_at(table, rid)
+                if row is None:
+                    continue
+                yield row
+                n += 1
+                if limit is not None and n >= limit:
+                    return
+            return
+
         if plan.access in ("IndexScan", "IndexRangeScan"):
             raise NotImplementedFeature(
-                "El planificador eligió un IndexScan, pero los índices BTREE y "
-                "HASH todavía no están implementados."
+                "El planificador eligió un IndexScan, pero el árbol B+ todavía no "
+                "está implementado."
             )
 
         n = 0
@@ -405,6 +461,13 @@ def _matches(schema: Schema, row: tuple, where: Condition) -> bool:
         # Comparar CHAR con un numero, por ejemplo: el predicado no aplica.
         return False
     return True
+
+
+def _rid_of(sf, key):
+    hallazgo = sf._find_rid(key)
+    if hallazgo is None:
+        return None
+    return hallazgo if hasattr(hallazgo, "_fields") else hallazgo[0]
 
 
 def _validar_columna(schema: Schema, nombre: str, tabla: str) -> None:

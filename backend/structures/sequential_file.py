@@ -183,6 +183,26 @@ class SequentialFile:
             for raw in self._merged(self._read_main(p)):
                 yield self.schema.unpack(raw)
 
+    def _merged_with_rid(self, page: Page) -> Iterator[tuple[RID, bytes]]:
+        def tagged(pg: Page, area: str) -> Iterator[tuple[bytes, RID]]:
+            for slot, raw in enumerate(pg.records()):
+                yield raw, RID(pg.page_id, slot, area)
+
+        if page.aux_page_id == NULL_PAGE:
+            for raw, rid in tagged(page, "main"):
+                yield rid, raw
+            return
+
+        chain = (item for pg in self._chain_pages(page.aux_page_id) for item in tagged(pg, "overflow"))
+        merged = heapq.merge(tagged(page, "main"), chain, key=lambda item: self.schema.key_from_bytes(item[0]))
+        for raw, rid in merged:
+            yield rid, raw
+
+    def scan_with_rid(self) -> Iterator[tuple[RID, tuple]]:
+        for p in range(self.page_count):
+            for rid, raw in self._merged_with_rid(self._read_main(p)):
+                yield rid, self.schema.unpack(raw)
+
     # ------------------------------------------------------------ busqueda binaria
 
     def _locate(self, key) -> tuple[int, Page]:
