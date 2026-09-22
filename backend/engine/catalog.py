@@ -9,6 +9,12 @@ serializador de alto nivel, que el enunciado prohibe.
 El motor de almacenamiento se codifica en el sufijo del archivo:
     <tabla>.seq.dat   Sequential File
     <tabla>.heap.dat  Heap File
+
+Los indices secundarios siguen la misma logica autodescriptiva: un BTREE de
+la tabla <t> con nombre <n> vive en <t>__<n>.btree.dat, y ese archivo ya
+guarda su propio esquema de clave (ver BPlusTree), asi que el catalogo no
+necesita un archivo de metadatos aparte para reconstruirlos: alcanza con
+listar los que hagan match con <t>__*.btree.dat.
 """
 
 from __future__ import annotations
@@ -18,8 +24,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from backend.engine.errors import TableAlreadyExists, TableNotFound
+from backend.index.btree import BPlusTree
 from backend.storage.pager import peek_header
-from backend.storage.schema import Schema
+from backend.storage.schema import Column, Schema
 from backend.structures.heap_file import HeapFile
 from backend.structures.sequential_file import SequentialFile
 
@@ -30,6 +37,8 @@ ENGINE_CLASS = {"SEQUENTIAL": SequentialFile, "HEAP": HeapFile}
 
 ENGINE_SUFFIX = {"SEQUENTIAL": ".seq", "HEAP": ".heap"}
 SUFFIX_ENGINE = {v: k for k, v in ENGINE_SUFFIX.items()}
+
+INDEX_SUFFIX = "__"  # <tabla>__<indice>.btree.dat
 
 
 @dataclass
@@ -75,11 +84,15 @@ class Catalog:
         self.page_size = page_size
         self.cache_size = cache_size
         self._open: dict[str, SequentialFile] = {}
+        self._open_indexes: dict[tuple[str, str], BPlusTree] = {}
 
     # ------------------------------------------------------------- rutas
 
     def _base(self, table: str) -> str:
         return str(self.data_dir / table)
+
+    def _index_base(self, table: str, index_name: str) -> str:
+        return str(self.data_dir / f"{table}{INDEX_SUFFIX}{index_name}")
 
     def _engine_of(self, table: str) -> str | None:
         for suffix, engine in SUFFIX_ENGINE.items():
@@ -110,6 +123,73 @@ class Catalog:
             path = self.data_dir / f"{table}{suffix}{ext}"
             if path.exists():
                 path.unlink()
+        # Los indices BTREE de la tabla quedan huerfanos sin su tabla: se
+        # eliminan junto con ella.
+        for idx in self.indexes_of(table):
+            if idx["kind"] == "BTREE":
+                self.drop_index(table, idx["name"])
+
+    # -------------------------------------------------------- indices BTREE
+
+    def create_index(self, table: str, index_name: str, column: str) -> None:
+        if self._engine_of(table) is None:
+            raise TableNotFound(f"la tabla «{table}» no existe")
+        if any(i["name"] == index_name for i in self.indexes_of(table)):
+            raise TableAlreadyExists(f"el indice «{index_name}» ya existe en «{table}»")
+
+        f = self.open_table(table)
+        col = next((c for c in f.schema.columns if c.name.lower() == column.lower()), None)
+        if col is None:
+            raise TableNotFound(f"la columna «{column}» no existe en «{table}»")
+
+        col_idx = next(i for i, c in enumerate(f.schema.columns) if c.name.lower() == column.lower())
+
+        tree = BPlusTree(
+            self._index_base(table, index_name), col,
+            page_size=self.page_size, cache_size=self.cache_size,
+        )
+        # Construccion masiva: recorre la tabla una sola vez e inserta cada
+        # (clave, RID) -- equivalente a un bulk_load para el indice. OJO:
+        # la clave del indice es el valor de `column`, no la PK de la tabla
+        # (key_from_bytes siempre extrae la PK; por eso se usa unpack()
+        # completo y se proyecta la columna indexada).
+        from backend.index.btree import RID
+        for rid_page in range(f.page_count):
+            page = f._read_page(rid_page) if hasattr(f, "_read_page") else f._read_main(rid_page)
+            for slot in range(getattr(page, "capacity", 0)):
+                if page.is_occupied(slot):
+                    raw = page.read_record(slot)
+                    values = f.schema.unpack(raw)
+                    tree.insert(values[col_idx], RID(page.page_id, slot))
+        tree.flush()
+        self._open_indexes[(table, index_name)] = tree
+
+    def drop_index(self, table: str, index_name: str) -> None:
+        self.close_index(table, index_name)
+        path = self.data_dir / f"{table}{INDEX_SUFFIX}{index_name}.btree.dat"
+        if path.exists():
+            path.unlink()
+
+    def open_index(self, table: str, index_name: str) -> BPlusTree:
+        key = (table, index_name)
+        if key in self._open_indexes:
+            return self._open_indexes[key]
+        path = self.data_dir / f"{table}{INDEX_SUFFIX}{index_name}.btree.dat"
+        if not path.exists():
+            raise TableNotFound(f"el indice «{index_name}» no existe en «{table}»")
+        header = peek_header(str(path))
+        key_column = header["schema"].columns[0]
+        tree = BPlusTree(
+            self._index_base(table, index_name), key_column,
+            page_size=header["page_size"], cache_size=self.cache_size,
+        )
+        self._open_indexes[key] = tree
+        return tree
+
+    def close_index(self, table: str, index_name: str) -> None:
+        tree = self._open_indexes.pop((table, index_name), None)
+        if tree is not None:
+            tree.close()
 
     # ------------------------------------------------------------- acceso
 
@@ -143,6 +223,8 @@ class Catalog:
     def close_all(self) -> None:
         for table in list(self._open):
             self.close_table(table)
+        for table, index_name in list(self._open_indexes):
+            self.close_index(table, index_name)
 
     # ------------------------------------------------------------- listado
 
@@ -187,19 +269,32 @@ class Catalog:
         El Sequential File tiene un indice primario implicito: la ordenacion
         fisica por clave, sobre la que hace busqueda binaria. El Heap File no
         tiene ninguno, y por eso toda consulta sobre el es un full scan.
-        Los BTREE y HASH apareceran aqui cuando se implementen.
+        Los indices BTREE se descubren igual que las tablas: escaneando el
+        directorio en busca de <tabla>__<nombre>.btree.dat y leyendo su
+        columna clave con peek_header, sin metadatos externos. El HASH
+        aparecera aqui cuando se implemente.
         """
-        if self._engine_of(table) != "SEQUENTIAL":
-            return []
-        f = self.open_table(table)
-        return [
-            {
+        out = []
+        if self._engine_of(table) == "SEQUENTIAL":
+            f = self.open_table(table)
+            out.append({
                 "name": f"pk_{table}",
                 "column": f.schema.pk_column.name,
                 "kind": "SEQUENTIAL",
                 "implicit": True,
-            }
-        ]
+            })
+
+        prefix = f"{table}{INDEX_SUFFIX}"
+        for path in self.data_dir.glob(f"{prefix}*.btree.dat"):
+            index_name = path.name[len(prefix) : -len(".btree.dat")]
+            header = peek_header(str(path))
+            out.append({
+                "name": index_name,
+                "column": header["schema"].columns[0].name,
+                "kind": "BTREE",
+                "implicit": False,
+            })
+        return out
 
     def list_tables(self) -> list[TableInfo]:
         return [self.describe(t) for t in self.table_names()]
