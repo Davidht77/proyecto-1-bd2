@@ -2,9 +2,9 @@
 
 Compara el tiempo total y las escrituras I/O al insertar lotes crecientes de
 tuplas en cada motor de almacenamiento (Heap, Sequential con y sin
-reorganizacion automatica) y claves en el Hash Dinamico (indice, no motor
-de tabla: se mide el insert directo sobre el indice con RIDs sinteticos,
-sin pasar por una tabla real).
+reorganizacion automatica) y claves en Arbol B+ y Hash Dinamico (indices,
+no motores de tabla: se mide el insert directo sobre el indice con RIDs
+sinteticos, sin pasar por una tabla real).
 
 El Sequential se construye con SequentialFile directo (no via Catalog):
 Catalog.create_table no expone auto_reorganize, y el flag no se guarda en
@@ -12,9 +12,6 @@ el header del archivo, asi que reabrir con Catalog siempre volveria a
 True.
 
 PENDIENTE (no cubierto todavia por este modulo):
-  - Arbol B+: a diferencia de Heap/Sequential/Hash, no expone un solo
-    DiskCounter (falta decidir si se mide sobre una tabla real o, como el
-    Hash aqui, con claves sinteticas directo al indice).
   - Exportar resultados a CSV/grafica para el informe.
   - Conectar esto a POST /api/benchmarks/run.
 """
@@ -27,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from backend.engine.catalog import Catalog
+from backend.index.btree import BPlusTree
+from backend.index.btree import RID as BTreeRID
 from backend.index.hash import ExtendibleHash
 from backend.index.hash import RID as HashRID
 from backend.storage.schema import Column, ColumnType, Schema
@@ -108,8 +107,22 @@ def _insertar_hash(data_dir: Path, filas: list[tuple]) -> InsertResult:
     return resultado
 
 
+def _insertar_btree(data_dir: Path, filas: list[tuple]) -> InsertResult:
+    tree = BPlusTree(str(data_dir / "bench_btree"), SCHEMA.columns[0], page_size=4096)
+
+    t0 = time.perf_counter()
+    for i, fila in enumerate(filas):
+        tree.insert(fila[0], BTreeRID(i, 0))
+    tree.flush()
+    total_ms = (time.perf_counter() - t0) * 1000.0
+
+    resultado = InsertResult("BTREE", len(filas), total_ms, tree.counter.disk_writes)
+    tree.close()
+    return resultado
+
+
 def run(data_dir: str = "data/benchmarks/exp1") -> list[InsertResult]:
-    """Corre el Experimento 1 para HEAP, SEQUENTIAL (con y sin reorg) y HASH."""
+    """Corre el Experimento 1 para HEAP, SEQUENTIAL (con y sin reorg), BTREE y HASH."""
     base = Path(data_dir)
     resultados = []
     for n in N_VALUES:
@@ -124,6 +137,10 @@ def run(data_dir: str = "data/benchmarks/exp1") -> list[InsertResult]:
             run_dir = base / f"sequential_{sufijo}" / str(n)
             run_dir.mkdir(parents=True, exist_ok=True)
             resultados.append(_insertar_sequential(run_dir, filas, auto_reorganize))
+
+        run_dir = base / "btree" / str(n)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        resultados.append(_insertar_btree(run_dir, filas))
 
         run_dir = base / "hash" / str(n)
         run_dir.mkdir(parents=True, exist_ok=True)
