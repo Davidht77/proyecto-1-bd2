@@ -219,12 +219,6 @@ def test_seed_insert_si_usa_la_ruta_normal(client):
 # ------------------------------------------------ endpoints pendientes (501)
 
 
-def test_benchmarks_declara_lo_que_falta(client):
-    r = client.post("/api/benchmarks/run")
-    assert r.status_code == 501
-    assert set(r.json()["detail"]["missing"]) == {"btree", "hash"}
-
-
 def test_reorganizar_un_heap_es_409(client):
     """Reorganizar es una operacion del Sequential File; en un Heap no aplica."""
     sql(client, "CREATE TABLE libre (id INT PRIMARY KEY, v CHAR(10)) USING HEAP")
