@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from backend.engine.catalog import Catalog
+from backend.index.btree import BPlusTree
+from backend.index.btree import RID as BTreeRID
 from backend.index.hash import ExtendibleHash
 from backend.index.hash import RID as HashRID
 from backend.storage.schema import Column, ColumnType, Schema
@@ -108,8 +110,23 @@ def _insertar_hash(data_dir: Path, filas: list[tuple]) -> InsertResult:
     return resultado
 
 
+def _insertar_btree(data_dir: Path, filas: list[tuple]) -> InsertResult:
+    idx = BPlusTree(str(data_dir / "bench_btree"), SCHEMA.columns[0], page_size=4096)
+
+    t0 = time.perf_counter()
+    for i, fila in enumerate(filas):
+        idx.insert(fila[0], BTreeRID(i, 0))
+    idx.flush()
+    total_ms = (time.perf_counter() - t0) * 1000.0
+
+    writes = idx.pager.counter.disk_writes
+    resultado = InsertResult("BTREE", len(filas), total_ms, writes)
+    idx.close()
+    return resultado
+
+
 def run(data_dir: str = "data/benchmarks/exp1") -> list[InsertResult]:
-    """Corre el Experimento 1 para HEAP, SEQUENTIAL (con y sin reorg) y HASH."""
+    """Corre el Experimento 1 para HEAP, SEQUENTIAL (con y sin reorg), BTREE y HASH."""
     base = Path(data_dir)
     resultados = []
     for n in N_VALUES:
@@ -124,6 +141,10 @@ def run(data_dir: str = "data/benchmarks/exp1") -> list[InsertResult]:
             run_dir = base / f"sequential_{sufijo}" / str(n)
             run_dir.mkdir(parents=True, exist_ok=True)
             resultados.append(_insertar_sequential(run_dir, filas, auto_reorganize))
+
+        run_dir = base / "btree" / str(n)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        resultados.append(_insertar_btree(run_dir, filas))
 
         run_dir = base / "hash" / str(n)
         run_dir.mkdir(parents=True, exist_ok=True)

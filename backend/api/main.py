@@ -85,6 +85,15 @@ class SeedRequest(BaseModel):
     shuffle: bool = Field(True, description="Desordenar las claves antes de cargarlas")
 
 
+class BenchmarkRequest(BaseModel):
+    experiment: int = Field(
+        0, 
+        ge=0, 
+        le=4, 
+        description="Número de experimento a correr (1, 2, 3, 4). 0 para correr todos (¡puede tardar mucho!)."
+    )
+
+
 # ------------------------------------------------------------- manejo de errores
 
 
@@ -310,23 +319,34 @@ def seed(table: str, req: SeedRequest) -> dict:
 
 
 @app.post("/api/benchmarks/run")
-def run_benchmarks() -> dict:
-    """PENDIENTE: suite de los 4 experimentos del enunciado (seccion 4).
-
-    Requiere Heap File, Arbol B+ y Hash Dinamico para poder comparar. Con solo
-    el Sequential File la comparativa no tiene sentido.
-    """
-    raise HTTPException(
-        501,
-        {
-            "error": "no_implementado",
-            "detail": "La suite de benchmarks necesita el árbol B+ y el hashing "
-            "dinámico para completar la comparativa de los 4 experimentos. "
-            "Mientras tanto, usa POST /api/tables/{t}/seed y POST /api/query, que "
-            "ya reportan I/O y latencia por operación para Heap y Sequential.",
-            "missing": ["btree", "hash"],
-        },
-    )
+def run_benchmarks(req: BenchmarkRequest = BenchmarkRequest(experiment=0)) -> dict:
+    import shutil
+    from backend.benchmarks import experiment1, experiment2, experiment3, experiment4
+    
+    bench_dir = Path(DATA_DIR) / "benchmarks"
+    if bench_dir.exists():
+        shutil.rmtree(bench_dir)
+        
+    resultados = {}
+    
+    if req.experiment in (0, 1):
+        # Experiment 1 returns a list of InsertResult (dataclass, needs dict conversion)
+        res1 = experiment1.run(str(bench_dir / "exp1"))
+        resultados["experiment_1"] = [r.__dict__ for r in res1]
+        
+    if req.experiment in (0, 2):
+        resultados["experiment_2"] = experiment2.run(str(bench_dir / "exp2"))
+        
+    if req.experiment in (0, 3):
+        resultados["experiment_3"] = experiment3.run(str(bench_dir / "exp3"))
+        
+    if req.experiment in (0, 4):
+        resultados["experiment_4"] = experiment4.run(str(bench_dir / "exp4"))
+        
+    return {
+        "status": "ok",
+        "results": resultados
+    }
 
 
 @app.get("/api/tables/{table}/index/{index_name}")
