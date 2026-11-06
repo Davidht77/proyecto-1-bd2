@@ -5,7 +5,7 @@ Capa de memoria secundaria y organización **Sequential File**.
 ## Levantar el sistema
 
 ```bash
-pip install fastapi uvicorn pydantic pytest
+pip install fastapi uvicorn pydantic pytest snowballstemmer
 cd frontend && npm install && npm run build && cd ..
 python -m uvicorn backend.api.main:app --port 8000
 ```
