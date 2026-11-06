@@ -16,9 +16,12 @@ POSTING = Schema([Column(n, ColumnType.INT) for n in ("page", "slot", "tf", "dl"
 
 
 class PostingsFile:
+    """`schema` cambia el registro: los bloques de SPIMI guardan ademas el termino."""
+
     def __init__(self, path: str, page_size: int = 4096, cache_size: int = 0,
-                 counter: DiskCounter | None = None):
-        self.pager = Pager(path, record_size=POSTING.record_size, schema=POSTING,
+                 counter: DiskCounter | None = None, schema: Schema = POSTING):
+        self.schema = schema
+        self.pager = Pager(path, record_size=schema.record_size, schema=schema,
                            page_size=page_size, cache_size=cache_size, counter=counter)
 
     def write(self, postings: Iterable[tuple]) -> int:
@@ -34,7 +37,7 @@ class PostingsFile:
                     self.pager.write_page(page)
                 page = new
             n = page.record_count
-            page.write_record(n, POSTING.pack(p))
+            page.write_record(n, self.schema.pack(p))
             page.set_occupied(n, True)
             page.record_count = n + 1
         if page is not None:
@@ -45,7 +48,7 @@ class PostingsFile:
         out, pid = [], head
         while pid != NULL_PAGE:
             page = self.pager.read_page(pid)
-            out.extend(POSTING.unpack(r) for r in page.records())
+            out.extend(self.schema.unpack(r) for r in page.records())
             pid = page.next_page_id
         return out
 

@@ -3,30 +3,47 @@
 Los repetidos se conservan porque SPIMI cuenta el tf a partir de esta lista.
 Cada termino se corta a MAX_TERM_BYTES porque el vocabulario lo guarda en un
 CHAR de ancho fijo.
+
+Stopwords: listas de NLTK en ingles y espanol (nltk_data/corpora/stopwords),
+las mismas del full-text search de PostgreSQL. Se copiaron una vez al repo
+para no depender de internet.
+
+Bilingue: cada documento usa el stemmer de su idioma, detectado por cual lista
+de stopwords aparece mas (empate -> ingles). La consulta es corta y puede no
+traer stopwords, asi que pasa por los dos stemmers y busca ambas raices.
 """
 
 import re
+from pathlib import Path
 
 import snowballstemmer
 
 MAX_TERM_BYTES = 24
 
 _WORD = re.compile(r"[^\W\d_]+")
-_STEMMER = snowballstemmer.stemmer("english")
-STOPWORDS = frozenset("""
-a about above after again against all am an and any are as at be because been
-before being below between both but by can could did do does doing down during
-each few for from further had has have having he her here hers herself him
-himself his how i if in into is it its itself just me more most my myself no
-nor not now of off on once only or other our ours ourselves out over own same
-she should so some such than that the their theirs them themselves then there
-these they this those through to too under until up very was we were what when
-where which while who whom why will with would you your yours yourself
-yourselves
-""".split())
+_LANGS = ("english", "spanish")
+_STEMMERS = {lang: snowballstemmer.stemmer(lang) for lang in _LANGS}
+
+
+def _load(lang: str) -> set[str]:
+    with open(Path(__file__).parent / "stopwords" / f"{lang}.txt", encoding="utf-8") as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+_STOP = {lang: _load(lang) for lang in _LANGS}
+STOPWORDS = frozenset(_STOP["english"] | _STOP["spanish"])
+
+
+def _cut(term: str) -> str:
+    return term.encode("utf-8")[:MAX_TERM_BYTES].decode("utf-8", "ignore")
 
 
 def preprocess(text: str) -> list[str]:
+    words = _WORD.findall(text.lower())
+    lang = max(_LANGS, key=lambda l: sum(w in _STOP[l] for w in words))
+    return [_cut(t) for t in _STEMMERS[lang].stemWords([w for w in words if w not in STOPWORDS])]
+
+
+def preprocess_query(text: str) -> list[str]:
     words = [w for w in _WORD.findall(text.lower()) if w not in STOPWORDS]
-    return [t.encode("utf-8")[:MAX_TERM_BYTES].decode("utf-8", "ignore")
-            for t in _STEMMER.stemWords(words)]
+    return list(dict.fromkeys(_cut(s.stemWord(w)) for w in words for s in _STEMMERS.values()))
