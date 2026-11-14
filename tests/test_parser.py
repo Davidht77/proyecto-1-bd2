@@ -135,9 +135,11 @@ def test_select_solo_cota_superior():
     assert w.lo is None and w.hi == 100 and not w.hi_inclusive
 
 
-def test_where_sobre_dos_columnas_falla():
-    with pytest.raises(SQLSyntaxError, match="una columna"):
-        parse("SELECT * FROM t WHERE a > 1 AND b < 2")
+def test_where_sobre_dos_columnas_genera_dos_filtros():
+    """Entregable 2 (5.4): el WHERE combina predicados sobre columnas distintas."""
+    st = parse("SELECT * FROM t WHERE a > 1 AND b < 2")
+    assert [f.column for f in st.filters] == ["a", "b"]
+    assert st.where is st.filters[0]
 
 
 def test_select_con_limit():
@@ -173,7 +175,7 @@ def test_create_index_hash():
 
 def test_indice_no_soportado_falla():
     with pytest.raises(SQLSyntaxError, match="tipo de indice"):
-        parse("CREATE INDEX i ON t (a) USING RTREE")
+        parse("CREATE INDEX i ON t (a) USING QUADTREE")
 
 
 def test_drop_table():

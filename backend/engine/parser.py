@@ -1,17 +1,29 @@
 """Parser SQL por descenso recursivo.
 
-Gramatica soportada en el Entregable 1:
+Gramatica soportada (Entregable 1 + extension multimodal del Entregable 2, 5.4):
 
     CREATE TABLE <t> (<col> <tipo> [PRIMARY KEY], ...) [USING HEAP|SEQUENTIAL]
+        <tipo> := INT | FLOAT | CHAR(n) | VECTOR(d)
     DROP TABLE <t>
-    INSERT INTO <t> VALUES (<v>, ...)
-    SELECT * | <col>, ... FROM <t> [WHERE <cond>]
-    DELETE FROM <t> WHERE <cond>
-    CREATE INDEX <nombre> ON <t> (<col>) USING BTREE|HASH
+    INSERT INTO <t> VALUES (<v>, ...)          -- un vector se escribe '[x1, x2, ...]'
+    SELECT <item>, ... FROM <t> [WHERE <pred> {AND <pred>}]
+           [ORDER BY <clave> [ASC|DESC]] [LIMIT n]
+        <item>  := * | <col> | <col> <-> '<vec>' [AS alias] | <col> <=> '<vec>' [AS alias]
+                 | COSINE_SCORE() [AS alias] | BM25_SCORE() [AS alias]
+        <clave> := <col> | <alias> | <col> <-> '<vec>' | <col> <=> '<vec>'
+    DELETE FROM <t> WHERE <pred> {AND <pred>}
+    CREATE INDEX <nombre> ON <t> (<col>) USING <tipo> [WITH (<k> = <v>, ...)]
+        <tipo> := BTREE | HASH | IVF | HNSW | RTREE | INVERTED
+    SET <nombre>[.<nombre>] = <v>              -- p. ej. SET ivf.probes = 5
 
-    <cond> := <col> = <v>
-            | <col> <op> <v> [AND <col> <op> <v>]
-            | <col> BETWEEN <v> AND <v>
+    <pred> := <col> = <v> | <col> <op> <v> | <col> BETWEEN <v> AND <v>
+            | <col> MATCH '<consulta>'                     (modulo textual)
+            | <col> WITHIN_RADIUS ((<x>, <y>), <r>)        (modulo espacial)
+
+Varios predicados sobre la misma columna se intersectan en un solo rango; los
+predicados sobre columnas distintas quedan en `filters` para que el
+planificador elija cual resuelve con un indice y cuales evalua como filtro
+residual.
 
 No se usa ninguna libreria de parsing: el enunciado exige construir el parser
 desde cero.
@@ -24,7 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from backend.engine.errors import SQLSyntaxError
-from backend.storage.schema import Column, ColumnType
+from backend.storage.schema import Column, ColumnType, parse_vector
 
 # --------------------------------------------------------------------- AST
 
@@ -50,6 +62,56 @@ class Condition:
 
 
 @dataclass
+class DistanceExpr:
+    """`<col> <-> '[...]'` (L2) o `<col> <=> '[...]'` (distancia coseno)."""
+
+    column: str
+    operator: str  # "<->" | "<=>"
+    vector: tuple[float, ...]
+    alias: str | None = None
+
+    @property
+    def metric(self) -> str:
+        return "L2" if self.operator == "<->" else "COSINE"
+
+    @property
+    def label(self) -> str:
+        return self.alias or f"{self.column} {self.operator} q"
+
+
+@dataclass
+class ScoreExpr:
+    """COSINE_SCORE() / BM25_SCORE(): relevancia textual del predicado MATCH."""
+
+    function: str
+    alias: str | None = None
+
+    @property
+    def label(self) -> str:
+        return self.alias or f"{self.function.lower()}()"
+
+
+@dataclass
+class TextMatch:
+    column: str
+    query: str
+
+
+@dataclass
+class SpatialRadius:
+    column: str
+    x: float
+    y: float
+    radius: float
+
+
+@dataclass
+class OrderBy:
+    key: "str | DistanceExpr"
+    descending: bool = False
+
+
+@dataclass
 class CreateTable:
     table: str
     columns: list[Column]
@@ -71,15 +133,29 @@ class Insert:
 @dataclass
 class Select:
     table: str
-    columns: list[str] = field(default_factory=list)  # vacio = *
-    where: Condition | None = None
+    columns: list = field(default_factory=list)  # str | DistanceExpr | ScoreExpr; vacio = *
+    where: Condition | None = None  # primer predicado relacional (compatibilidad P1)
     limit: int | None = None
+    filters: list[Condition] = field(default_factory=list)  # todos los predicados relacionales
+    order_by: OrderBy | None = None
+    special: list = field(default_factory=list)  # TextMatch | SpatialRadius
+
+    @property
+    def distance(self) -> DistanceExpr | None:
+        """La expresion de distancia de la consulta, venga del SELECT o del ORDER BY."""
+        for c in self.columns:
+            if isinstance(c, DistanceExpr):
+                return c
+        if self.order_by and isinstance(self.order_by.key, DistanceExpr):
+            return self.order_by.key
+        return None
 
 
 @dataclass
 class Delete:
     table: str
     where: Condition | None = None
+    filters: list[Condition] = field(default_factory=list)
 
 
 @dataclass
@@ -87,10 +163,19 @@ class CreateIndex:
     name: str
     table: str
     column: str
-    kind: str  # "BTREE" | "HASH"
+    kind: str  # "BTREE" | "HASH" | "IVF" | "HNSW" | "RTREE" | "INVERTED"
+    options: dict = field(default_factory=dict)
 
 
-Statement = CreateTable | DropTable | Insert | Select | Delete | CreateIndex
+@dataclass
+class SetOption:
+    name: str  # en minusculas, p. ej. "ivf.probes"
+    value: Any
+
+
+Statement = CreateTable | DropTable | Insert | Select | Delete | CreateIndex | SetOption
+
+INDEX_KINDS = ("BTREE", "HASH", "IVF", "HNSW", "RTREE", "INVERTED")
 
 
 # ---------------------------------------------------------------- tokenizer
@@ -100,9 +185,9 @@ _TOKEN_RE = re.compile(
       (?P<ws>\s+)
     | (?P<comment>--[^\n]*)
     | (?P<string>'(?:[^']|'')*')
-    | (?P<number>-?\d+\.\d+|-?\d+)
-    | (?P<op><=|>=|<>|!=|=|<|>)
-    | (?P<punct>[(),;*])
+    | (?P<number>-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)
+    | (?P<op><->|<=>|<=|>=|<>|!=|=|<|>)
+    | (?P<punct>[(),;*.])
     | (?P<ident>[A-Za-z_][A-Za-z_0-9]*)
     """,
     re.VERBOSE,
@@ -112,7 +197,7 @@ _KEYWORDS = {
     "CREATE", "TABLE", "DROP", "INSERT", "INTO", "VALUES", "SELECT", "FROM",
     "WHERE", "DELETE", "INDEX", "ON", "USING", "AND", "BETWEEN", "PRIMARY",
     "KEY", "INT", "FLOAT", "CHAR", "HEAP", "SEQUENTIAL", "BTREE", "HASH",
-    "LIMIT",
+    "LIMIT", "ORDER", "BY", "ASC", "DESC", "AS", "SET", "WITH", "MATCH",
 }
 
 
@@ -142,7 +227,7 @@ def tokenize(sql: str) -> list[Token]:
             else:
                 tokens.append(Token("ident", text, m.start()))
         elif kind == "number":
-            value = float(text) if ("." in text) else int(text)
+            value = float(text) if any(ch in text for ch in ".eE") else int(text)
             tokens.append(Token("number", value, m.start()))
         elif kind == "string":
             tokens.append(Token("string", text[1:-1].replace("''", "'"), m.start()))
@@ -229,6 +314,8 @@ class Parser:
             stmt = self._select()
         elif tok.value == "DELETE":
             stmt = self._delete()
+        elif tok.value == "SET":
+            stmt = self._set()
         else:
             raise SQLSyntaxError(f"sentencia no soportada: {tok.value}")
 
@@ -268,13 +355,24 @@ class Parser:
                     raise SQLSyntaxError(f"CHAR necesita una longitud entera positiva, no {longitud}")
                 self._expect("punct", ")")
                 col = Column(name, ColumnType.CHAR, longitud)
+            elif tipo == "VECTOR":
+                self._expect("punct", "(")
+                dim = self._expect("number").value
+                if not isinstance(dim, int) or not 0 < dim <= 4096:
+                    raise SQLSyntaxError(f"VECTOR necesita una dimension entera entre 1 y 4096, no {dim}")
+                self._expect("punct", ")")
+                col = Column(name, ColumnType.VECTOR, dim)
             else:
-                raise SQLSyntaxError(f"tipo no soportado: {tipo}. Usa INT, FLOAT o CHAR(n).")
+                raise SQLSyntaxError(
+                    f"tipo no soportado: {tipo}. Usa INT, FLOAT, CHAR(n) o VECTOR(d)."
+                )
 
             if self._accept("keyword", "PRIMARY"):
                 self._expect("keyword", "KEY")
                 if pk_index is not None:
                     raise SQLSyntaxError("la tabla solo puede tener una PRIMARY KEY")
+                if col.type is ColumnType.VECTOR:
+                    raise SQLSyntaxError("un VECTOR no puede ser PRIMARY KEY")
                 pk_index = len(columns)
 
             columns.append(col)
@@ -292,6 +390,10 @@ class Parser:
 
         if pk_index is None:
             pk_index = 0  # por convencion, la primera columna
+            if columns[0].type is ColumnType.VECTOR:
+                raise SQLSyntaxError(
+                    "la primera columna es un VECTOR: declara explicitamente la PRIMARY KEY"
+                )
 
         return CreateTable(table, columns, pk_index, engine)
 
@@ -305,12 +407,35 @@ class Parser:
         self._expect("keyword", "USING")
         tok = self._next()
         kind = str(tok.value).upper()
-        if kind not in ("BTREE", "HASH"):
+        if kind not in INDEX_KINDS:
             raise SQLSyntaxError(
-                f"tipo de indice no soportado: {kind}. Usa BTREE o HASH. "
-                "(R-Tree, indice invertido y busqueda vectorial son del Entregable 2.)"
+                f"tipo de indice no soportado: {kind}. Usa {', '.join(INDEX_KINDS)}."
             )
-        return CreateIndex(name, table, column, kind)
+        options: dict = {}
+        if self._accept("keyword", "WITH"):
+            self._expect("punct", "(")
+            while True:
+                clave = self._expect_name().lower()
+                self._expect("op", "=")
+                tok = self._next()
+                if tok.kind not in ("number", "string", "ident", "keyword"):
+                    raise SQLSyntaxError(f"valor invalido para la opcion «{clave}»: {tok.value!r}")
+                options[clave] = tok.value
+                if not self._accept("punct", ","):
+                    break
+            self._expect("punct", ")")
+        return CreateIndex(name, table, column, kind, options)
+
+    def _set(self) -> SetOption:
+        self._expect("keyword", "SET")
+        partes = [self._expect_name()]
+        while self._accept("punct", "."):
+            partes.append(self._expect_name())
+        self._expect("op", "=")
+        tok = self._next()
+        if tok.kind not in ("number", "string", "ident", "keyword"):
+            raise SQLSyntaxError(f"valor invalido en SET: {tok.value!r}")
+        return SetOption(".".join(partes).lower(), tok.value)
 
     def _insert(self) -> Insert:
         self._expect("keyword", "INSERT")
@@ -326,34 +451,104 @@ class Parser:
 
     def _select(self) -> Select:
         self._expect("keyword", "SELECT")
-        columns: list[str] = []
-        if self._accept("punct", "*"):
-            pass
-        else:
-            columns.append(self._expect_name())
+        columns: list = []
+        if not self._accept("punct", "*"):
+            columns.append(self._select_item())
             while self._accept("punct", ","):
-                columns.append(self._expect_name())
+                columns.append(self._select_item())
         self._expect("keyword", "FROM")
         table = self._expect_name()
-        where = self._where()
+        filters, special = self._where()
+        order_by = None
+        if self._accept("keyword", "ORDER"):
+            self._expect("keyword", "BY")
+            name = self._expect_name()
+            key = self._distance_tail(name) or name
+            descending = bool(self._accept("keyword", "DESC"))
+            if not descending:
+                self._accept("keyword", "ASC")
+            order_by = OrderBy(key, descending)
         limit = None
         if self._accept("keyword", "LIMIT"):
             limit = self._expect("number").value
-        return Select(table, columns, where, limit)
+            if not isinstance(limit, int) or limit < 0:
+                raise SQLSyntaxError(f"LIMIT necesita un entero no negativo, no {limit}")
+        if sum(isinstance(c, DistanceExpr) for c in columns) > 1:
+            raise SQLSyntaxError("solo se admite una expresion de distancia vectorial por consulta")
+        return Select(table, columns, filters[0] if filters else None, limit,
+                      filters, order_by, special)
+
+    def _select_item(self):
+        name = self._expect_name()
+        if self._accept("punct", "("):
+            self._expect("punct", ")")
+            funcion = name.upper()
+            if funcion not in ("COSINE_SCORE", "BM25_SCORE"):
+                raise SQLSyntaxError(
+                    f"funcion no soportada: {name}(). Usa COSINE_SCORE() o BM25_SCORE()."
+                )
+            return ScoreExpr(funcion, self._alias())
+        dist = self._distance_tail(name)
+        if dist is not None:
+            dist.alias = self._alias()
+            return dist
+        return name
+
+    def _distance_tail(self, column: str) -> DistanceExpr | None:
+        """Si sigue `<->` o `<=>`, consume el literal vectorial."""
+        tok = self._peek()
+        if not (tok and tok.kind == "op" and tok.value in ("<->", "<=>")):
+            return None
+        self._next()
+        lit = self._next()
+        if lit.kind != "string":
+            raise SQLSyntaxError(
+                f"despues de {tok.value} se esperaba un vector entre comillas, p. ej. '[0.1, 0.2]'"
+            )
+        try:
+            vector = parse_vector(lit.value)
+        except ValueError as exc:
+            raise SQLSyntaxError(str(exc)) from None
+        if not vector:
+            raise SQLSyntaxError("el vector de consulta esta vacio")
+        return DistanceExpr(column, tok.value, vector)
+
+    def _alias(self) -> str | None:
+        if self._accept("keyword", "AS"):
+            return self._expect_name()
+        return None
 
     def _delete(self) -> Delete:
         self._expect("keyword", "DELETE")
         self._expect("keyword", "FROM")
         table = self._expect_name()
-        where = self._where()
-        return Delete(table, where)
+        filters, special = self._where()
+        if special:
+            raise SQLSyntaxError("DELETE no admite predicados MATCH ni WITHIN_RADIUS")
+        return Delete(table, filters[0] if filters else None, filters)
 
     # -- WHERE --------------------------------------------------------------
 
-    def _where(self) -> Condition | None:
+    def _where(self) -> tuple[list[Condition], list]:
+        """Conjuncion de predicados. Devuelve (relacionales, especiales)."""
         if not self._accept("keyword", "WHERE"):
-            return None
+            return [], []
+        por_columna: dict[str, Condition] = {}
+        special: list = []
+        while True:
+            pred = self._predicate()
+            if isinstance(pred, Condition):
+                clave = pred.column.lower()
+                por_columna[clave] = (
+                    _merge(por_columna[clave], pred) if clave in por_columna else pred
+                )
+            else:
+                special.append(pred)
+            if not self._accept("keyword", "AND"):
+                break
+        return list(por_columna.values()), special
 
+    def _predicate(self):
         column = self._expect_name()
 
         if self._accept("keyword", "BETWEEN"):
@@ -362,22 +557,35 @@ class Parser:
             hi = self._value()
             return Condition(column, lo, hi)
 
+        if self._accept("keyword", "MATCH"):
+            tok = self._next()
+            if tok.kind != "string":
+                raise SQLSyntaxError("MATCH espera la consulta textual entre comillas")
+            return TextMatch(column, tok.value)
+
+        tok = self._peek()
+        if tok and tok.kind == "ident" and str(tok.value).upper() == "WITHIN_RADIUS":
+            self._next()
+            self._expect("punct", "(")
+            self._expect("punct", "(")
+            x = self._number()
+            self._expect("punct", ",")
+            y = self._number()
+            self._expect("punct", ")")
+            self._expect("punct", ",")
+            r = self._number()
+            self._expect("punct", ")")
+            return SpatialRadius(column, x, y, r)
+
         op = self._expect("op").value
         value = self._value()
-        cond = self._condition_from(column, op, value)
+        return self._condition_from(column, op, value)
 
-        if self._accept("keyword", "AND"):
-            col2 = self._expect_name()
-            if col2.lower() != column.lower():
-                raise SQLSyntaxError(
-                    f"el WHERE solo admite predicados sobre una columna; "
-                    f"se encontraron {column!r} y {col2!r}"
-                )
-            op2 = self._expect("op").value
-            val2 = self._value()
-            cond = _merge(cond, self._condition_from(col2, op2, val2))
-
-        return cond
+    def _number(self) -> float:
+        tok = self._next()
+        if tok.kind != "number":
+            raise SQLSyntaxError(f"se esperaba un numero, se encontro {tok.value!r}")
+        return float(tok.value)
 
     def _condition_from(self, column: str, op: str, value: Any) -> Condition:
         if op == "=":
