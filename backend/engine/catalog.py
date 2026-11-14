@@ -23,15 +23,23 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from backend.engine.errors import ColumnNotFound, NotImplementedFeature, TableAlreadyExists, TableNotFound
+from backend.engine.errors import (
+    ColumnNotFound,
+    NotImplementedFeature,
+    SQLRuntimeError,
+    TableAlreadyExists,
+    TableNotFound,
+)
 from backend.index.btree import BPlusTree
 from backend.index.btree import RID as BTreeRID
 from backend.index.hash import ExtendibleHash
 from backend.index.hash import RID as HashRID
 from backend.storage.pager import peek_header
-from backend.storage.schema import Column, Schema
+from backend.storage.schema import Column, ColumnType, Schema
 from backend.structures.heap_file import HeapFile
 from backend.structures.sequential_file import SequentialFile
+from backend.vector.distance import METRICS
+from backend.vector.ivf import IVFIndex
 
 # Ambas organizaciones exponen la misma superficie: insert, search, delete,
 # scan, range_search, bulk_load, flush y close. El motor las trata por igual;
@@ -87,7 +95,7 @@ class Catalog:
         self.page_size = page_size
         self.cache_size = cache_size
         self._open: dict[str, SequentialFile] = {}
-        self._open_indexes: dict[tuple[str, str], ExtendibleHash | BPlusTree] = {}
+        self._open_indexes: dict[tuple[str, str], ExtendibleHash | BPlusTree | IVFIndex] = {}
 
     # ------------------------------------------------------------- rutas
 
@@ -133,8 +141,10 @@ class Catalog:
 
     # --------------------------------------------------------------- indices
 
-    def create_index(self, table: str, index_name: str, column: str, kind: str) -> None:
-        if kind not in ("HASH", "BTREE"):
+    def create_index(
+        self, table: str, index_name: str, column: str, kind: str, options: dict | None = None
+    ) -> None:
+        if kind not in ("HASH", "BTREE", "IVF"):
             raise NotImplementedFeature(f"CREATE INDEX ... USING {kind} todavía no está implementado.")
         if self._engine_of(table) is None:
             raise TableNotFound(f"la tabla «{table}» no existe")
@@ -147,6 +157,16 @@ class Catalog:
             raise ColumnNotFound(f"la columna «{column}» no existe en «{table}»")
         col_idx = f.schema.columns.index(col)
         base = self._index_base(table, index_name)
+
+        if kind == "IVF":
+            self._create_ivf(f, base, col, col_idx, options or {})
+            self._open_indexes[(table, index_name)] = IVFIndex(
+                base, page_size=self.page_size, cache_size=self.cache_size)
+            return
+        if col.type is ColumnType.VECTOR:
+            raise SQLRuntimeError(
+                f"la columna «{col.name}» es VECTOR: indexala con USING IVF, no con {kind}"
+            )
 
         if kind == "HASH":
             idx = ExtendibleHash(base, col, page_size=self.page_size, cache_size=self.cache_size)
@@ -172,11 +192,44 @@ class Catalog:
         tree.flush()
         self._open_indexes[(table, index_name)] = tree
 
-    def open_index(self, table: str, index_name: str) -> ExtendibleHash | BPlusTree:
+    def _create_ivf(self, f, base: str, col: Column, col_idx: int, options: dict) -> None:
+        """Construye un IVF sobre la columna VECTOR leyendo la tabla una sola vez.
+
+        Opciones (WITH ...): lists = C (por defecto floor(sqrt(N))),
+        metric = 'L2' | 'COSINE' (por defecto L2), iters = iteraciones de K-Means.
+        """
+        if col.type is not ColumnType.VECTOR:
+            raise SQLRuntimeError(f"IVF solo indexa columnas VECTOR; «{col.name}» es {col.type.name}")
+        metric = str(options.get("metric", "L2")).upper()
+        if metric not in METRICS:
+            raise SQLRuntimeError(f"metric = '{metric}' no soportada. Usa 'L2' o 'COSINE'.")
+        lists = options.get("lists")
+        if lists is not None and (not isinstance(lists, int) or lists <= 0):
+            raise SQLRuntimeError(f"lists debe ser un entero positivo, no {lists!r}")
+        iters = options.get("iters", 20)
+        desconocidas = set(options) - {"metric", "lists", "iters"}
+        if desconocidas:
+            raise SQLRuntimeError(f"opciones de IVF desconocidas: {', '.join(sorted(desconocidas))}")
+
+        pk = f.schema.pk_index
+        idx = IVFIndex(base, col, f.schema.pk_column, metric=metric,
+                       page_size=self.page_size, cache_size=self.cache_size)
+        try:
+            idx.build(((row[pk], rid, row[col_idx]) for rid, row in f.scan_with_rid()),
+                      n_lists=lists, n_iter=int(iters))
+        finally:
+            idx.close()
+
+    def open_index(self, table: str, index_name: str) -> ExtendibleHash | BPlusTree | IVFIndex:
         key = (table, index_name)
         if key in self._open_indexes:
             return self._open_indexes[key]
         base = self._index_base(table, index_name)
+        if Path(f"{base}.ivf.dir").exists():
+            header = peek_header(f"{base}.ivf.dir")
+            idx = IVFIndex(base, page_size=header["page_size"], cache_size=self.cache_size)
+            self._open_indexes[key] = idx
+            return idx
         if Path(f"{base}.hash.dir").exists():
             header = peek_header(f"{base}.hash.dir")
             idx = ExtendibleHash(base, header["schema"].columns[0], page_size=header["page_size"], cache_size=self.cache_size)
@@ -198,7 +251,8 @@ class Catalog:
     def drop_index(self, table: str, index_name: str) -> None:
         self.close_index(table, index_name)
         base = self._index_base(table, index_name)
-        for path in (Path(f"{base}.hash.dir"), Path(f"{base}.hash.bkt"), Path(f"{base}.btree.dat")):
+        for path in (Path(f"{base}.hash.dir"), Path(f"{base}.hash.bkt"), Path(f"{base}.btree.dat"),
+                     Path(f"{base}.ivf.dir"), Path(f"{base}.ivf.lst")):
             if path.exists():
                 path.unlink()
 
@@ -314,6 +368,16 @@ class Catalog:
                 "column": header["schema"].columns[0].name,
                 "kind": "HASH",
                 "implicit": False,
+            })
+        for path in self.data_dir.glob(f"{prefix}*.ivf.dir"):
+            index_name = path.name[len(prefix) : -len(".ivf.dir")]
+            stats = self.open_index(table, index_name).stats()
+            out.append({
+                "name": index_name,
+                "column": peek_header(str(path))["schema"].columns[0].name,
+                "kind": "IVF",
+                "implicit": False,
+                **{k: stats[k] for k in ("metric", "dim", "n_lists", "n_vectors")},
             })
         for path in self.data_dir.glob(f"{prefix}*.btree.dat"):
             index_name = path.name[len(prefix) : -len(".btree.dat")]

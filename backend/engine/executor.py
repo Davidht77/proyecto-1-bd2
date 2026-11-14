@@ -9,8 +9,19 @@ las reglas del enunciado (3.4):
     rango    sobre la PK (Sequential)-> BinaryRangeScan
     cualquier otro caso              -> SeqScan (Full Table Scan)
 
-Cada ejecucion reporta el desglose exacto de bloques leidos y escritos, y los
-tiempos de parseo y ejecucion en milisegundos.
+Con varios predicados (Entregable 2) se elige el que admite la mejor ruta de
+acceso y el resto se evalua como filtro residual sobre las filas recuperadas.
+
+Consultas vectoriales (ORDER BY <col> <->|<=> '[...]' LIMIT k), enunciado 5.4:
+
+    sin WHERE, con IVF               -> IVFScan (ANN, `SET ivf.probes`)
+    sin WHERE, sin IVF               -> KnnSeqScan (k-NN exacto, Max-Heap)
+    WHERE indexable, sin IVF         -> PreFilter (indice relacional + k-NN exacto)
+    WHERE no indexable, con IVF      -> PostFilter (candidatos ANN + filtro)
+    WHERE indexable y con IVF        -> PreFilter o PostFilter segun hybrid.choose_strategy
+
+Cada ejecucion reporta el desglose exacto de bloques leidos y escritos (por
+separado los del indice y los de la tabla) y los tiempos de parseo y ejecucion.
 """
 
 from __future__ import annotations
@@ -19,7 +30,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+
 from backend.engine.catalog import Catalog
+from backend.engine.hybrid import HybridEstimate, choose_strategy
 from backend.engine.errors import (
     ColumnNotFound,
     NotImplementedFeature,
@@ -31,14 +45,22 @@ from backend.engine.parser import (
     CreateIndex,
     CreateTable,
     Delete,
+    DistanceExpr,
     DropTable,
     Insert,
+    ScoreExpr,
     Select,
+    SetOption,
+    SpatialRadius,
     Statement,
+    TextMatch,
     parse,
 )
 from backend.index.hash import RID as HashRID
-from backend.storage.schema import Schema
+from backend.storage.page import page_capacity
+from backend.storage.schema import ColumnType, Schema, parse_vector
+from backend.vector.ivf import IVFIndex, VRID
+from backend.vector.knn import knn_linear
 
 
 @dataclass
@@ -92,10 +114,26 @@ class QueryResult:
 
 MAX_ROWS = 500  # el visor de resultados pagina; no tiene sentido enviar 500k filas
 
+# Opciones de sesion que acepta SET. Cada una: (valor por defecto, validador).
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "ivf.probes": 4,             # listas que escanea el IVF por consulta
+    "hybrid.strategy": "AUTO",   # AUTO | PRE | POST (forzar para experimentos)
+}
+
+# Orden de preferencia entre rutas de acceso cuando hay varios predicados.
+_ACCESS_RANK = {
+    "IndexScan": 0, "BinarySearch": 1, "IndexRangeScan": 2, "BinaryRangeScan": 3, "SeqScan": 9,
+}
+
+# Tope del conteo de filas candidatas que hace el planificador hibrido: pasado
+# este numero el pre-filtrado ya no puede ganar y no vale la pena seguir contando.
+ESTIMATE_CAP = 2000
+
 
 class Executor:
     def __init__(self, catalog: Catalog):
         self.catalog = catalog
+        self.settings: dict[str, Any] = dict(DEFAULT_SETTINGS)
 
     # ------------------------------------------------------------- entrada
 
@@ -123,6 +161,8 @@ class Executor:
             return self._delete(stmt)
         if isinstance(stmt, CreateIndex):
             return self._create_index(stmt)
+        if isinstance(stmt, SetOption):
+            return self._set(stmt)
         raise SQLRuntimeError(f"sentencia no soportada: {type(stmt).__name__}")
 
     # ------------------------------------------------------------- DDL
@@ -151,13 +191,27 @@ class Executor:
     def _create_index(self, stmt: CreateIndex) -> QueryResult:
         if not self.catalog.exists(stmt.table):
             raise TableNotFound(f"la tabla «{stmt.table}» no existe")
-        if stmt.kind not in ("HASH", "BTREE"):
+        if stmt.kind not in ("HASH", "BTREE", "IVF"):
+            dueno = {"RTREE": "el módulo espacial (R-Tree)",
+                     "INVERTED": "el módulo textual (índice invertido)",
+                     "HNSW": "una segunda estructura ANN (se implementó IVF)"}.get(stmt.kind, "")
             raise NotImplementedFeature(
-                f"CREATE INDEX ... USING {stmt.kind} todavía no está implementado."
+                f"CREATE INDEX ... USING {stmt.kind} todavía no está conectado al motor"
+                + (f": corresponde a {dueno}." if dueno else ".")
             )
+        if stmt.options and stmt.kind != "IVF":
+            raise SQLRuntimeError(f"USING {stmt.kind} no acepta opciones WITH (...)")
         _validar_columna(self.catalog.open_table(stmt.table).schema, stmt.column, stmt.table)
-        self.catalog.create_index(stmt.table, stmt.name, stmt.column, stmt.kind)
-        if stmt.kind == "HASH":
+        self.catalog.create_index(stmt.table, stmt.name, stmt.column, stmt.kind, stmt.options)
+        if stmt.kind == "IVF":
+            st = self.catalog.open_index(stmt.table, stmt.name).stats()
+            mensaje = (
+                f"Índice «{stmt.name}» creado (IVF, {st['metric']}) sobre "
+                f"{stmt.table}.{stmt.column}: {st['n_vectors']} vectores de dimensión "
+                f"{st['dim']} en {st['n_lists']} celdas de Voronoi, {st['list_pages']} "
+                f"páginas de listas ({st['records_per_page']} vectores por página)."
+            )
+        elif stmt.kind == "HASH":
             mensaje = f"Índice «{stmt.name}» creado sobre {stmt.table}({stmt.column}) usando HASH."
         else:
             tree = self.catalog.open_index(stmt.table, stmt.name)
@@ -171,6 +225,22 @@ class Executor:
             writes=1,
         )
 
+    def _set(self, stmt: SetOption) -> QueryResult:
+        if stmt.name not in DEFAULT_SETTINGS:
+            raise SQLRuntimeError(
+                f"opción desconocida: {stmt.name}. Disponibles: {', '.join(DEFAULT_SETTINGS)}"
+            )
+        valor = stmt.value
+        if stmt.name == "ivf.probes":
+            if not isinstance(valor, int) or valor < 1:
+                raise SQLRuntimeError("ivf.probes debe ser un entero >= 1")
+        elif stmt.name == "hybrid.strategy":
+            valor = str(valor).upper()
+            if valor not in ("AUTO", "PRE", "POST"):
+                raise SQLRuntimeError("hybrid.strategy debe ser AUTO, PRE o POST")
+        self.settings[stmt.name] = valor
+        return _ok(Plan("SET", None, f"{stmt.name} = {valor}"), message=f"{stmt.name} = {valor}")
+
     # ------------------------------------------------------------- DML
 
     def _insert(self, stmt: Insert) -> QueryResult:
@@ -180,11 +250,20 @@ class Executor:
                 f"la tabla «{stmt.table}» tiene {len(sf.schema.columns)} columnas, "
                 f"se dieron {len(stmt.values)} valores"
             )
+        # Los literales vectoriales llegan como string '[...]': se convierten una
+        # sola vez para que la tabla y el IVF reciban el mismo valor numerico.
+        valores = list(stmt.values)
+        for i, col in enumerate(sf.schema.columns):
+            if col.type is ColumnType.VECTOR:
+                try:
+                    valores[i] = parse_vector(valores[i], col.length)
+                except (ValueError, TypeError) as exc:
+                    raise SQLRuntimeError(f"columna «{col.name}»: {exc}") from None
         es_seq = self.catalog.engine_of(stmt.table) == "SEQUENTIAL"
         sf.counter.reset()
         paginas_antes = sf.page_count
-        rid = sf.insert(tuple(stmt.values))
-        self._index_on_insert(stmt.table, sf.schema, stmt.values, rid)
+        rid = sf.insert(tuple(valores))
+        self._index_on_insert(stmt.table, sf.schema, valores, rid)
         sf.flush()
 
         mensaje = "1 registro insertado."
@@ -220,19 +299,25 @@ class Executor:
             raise SQLRuntimeError(
                 "Un DELETE sin WHERE borraría la tabla entera. Usa DROP TABLE si es lo que quieres."
             )
-        _validar_columna(sf.schema, stmt.where.column, stmt.table)
-        plan = self._plan(sf, stmt.table, stmt.where, "Delete")
+        filtros = stmt.filters or [stmt.where]
+        for f in filtros:
+            _validar_columna(sf.schema, f.column, stmt.table)
+        acceso, plan = self._choose_access(sf, stmt.table, filtros, "Delete")
+        residuales = [f for f in filtros if f is not acceso]
 
         sf.counter.reset()
-        if plan.access == "BinarySearch":
-            claves = [stmt.where.lo] if sf.search(stmt.where.lo) is not None else []
+        if plan.access == "BinarySearch" and not residuales:
+            claves = [acceso.lo] if sf.search(acceso.lo) is not None else []
         else:
             claves = [
                 sf.schema.key_of(row)
-                for row in self._rows_for(sf, stmt.where, plan, limit=None, table=stmt.table)
+                for row in self._rows_for(sf, acceso, plan, limit=None, table=stmt.table)
+                if all(_matches(sf.schema, row, f) for f in residuales)
             ]
 
         indices_hash = self._hash_indexes_of(stmt.table)
+        indices_ivf = self._ivf_indexes_of(stmt.table)
+        es_heap = self.catalog.engine_of(stmt.table) == "HEAP"
         borradas = 0
         for k in claves:
             row = sf.search(k)
@@ -245,6 +330,12 @@ class Executor:
                 for info, col_idx in indices_hash:
                     idx = self.catalog.open_index(stmt.table, info["name"])
                     idx.delete(row[col_idx], rid=hash_rid)
+                    idx.flush()
+                for idx, col_idx in indices_ivf:
+                    idx.delete(k, row[col_idx])
+                if es_heap and indices_ivf:
+                    self._ivf_follow_move_the_last(sf, rid, k, indices_ivf)
+                for idx, _ in indices_ivf:
                     idx.flush()
         sf.flush()
 
@@ -265,11 +356,39 @@ class Executor:
             out.append((info, col_idx))
         return out
 
+    def _ivf_indexes_of(self, table: str) -> list[tuple[IVFIndex, int]]:
+        sf = self.catalog.open_table(table)
+        out = []
+        for info in self.catalog.indexes_of(table):
+            if info["kind"] != "IVF":
+                continue
+            col_idx = next(i for i, c in enumerate(sf.schema.columns)
+                           if c.name.lower() == info["column"].lower())
+            out.append((self.catalog.open_index(table, info["name"]), col_idx))
+        return out
+
+    def _ivf_follow_move_the_last(self, sf, rid, borrada, indices_ivf) -> None:
+        """El Heap File borra con move-the-last: la fila que estaba al final del
+        archivo ahora ocupa el RID de la borrada. Se actualiza su entrada en el
+        IVF para que el indice no quede apuntando a un RID viejo."""
+        page = sf.pager.read_page(rid.page_id)
+        if not page.is_occupied(rid.slot):
+            return
+        movida = sf.schema.unpack(page.read_record(rid.slot))
+        pk = sf.schema.key_of(movida)
+        if pk == borrada:
+            return
+        for idx, col_idx in indices_ivf:
+            idx.relocate(pk, movida[col_idx], rid)
+
     def _index_on_insert(self, table: str, schema: Schema, values: list, rid) -> None:
         hash_rid = HashRID.from_engine_rid(rid)
         for info, col_idx in self._hash_indexes_of(table):
             idx = self.catalog.open_index(table, info["name"])
             idx.insert(values[col_idx], hash_rid)
+            idx.flush()
+        for idx, col_idx in self._ivf_indexes_of(table):
+            idx.insert(values[schema.pk_index], rid, values[col_idx])
             idx.flush()
 
     # ------------------------------------------------------------- SELECT
@@ -278,33 +397,50 @@ class Executor:
         sf = self.catalog.open_table(stmt.table)
         schema = sf.schema
 
-        nombres = [c.name for c in schema.columns]
-        if stmt.columns:
-            for col in stmt.columns:
-                _validar_columna(schema, col, stmt.table)
-            proyeccion = [
-                next(i for i, n in enumerate(nombres) if n.lower() == c.lower())
-                for c in stmt.columns
-            ]
-            columnas = [nombres[i] for i in proyeccion]
-        else:
-            proyeccion = list(range(len(nombres)))
-            columnas = nombres
+        if stmt.special:
+            pred = stmt.special[0]
+            modulo = ("el módulo textual (índice invertido + COSINE_SCORE)"
+                      if isinstance(pred, TextMatch) else "el módulo espacial (R-Tree)")
+            raise NotImplementedFeature(
+                f"El predicado {'MATCH' if isinstance(pred, TextMatch) else 'WITHIN_RADIUS'} "
+                f"ya se parsea, pero su ejecución corresponde a {modulo}, que aún no está "
+                f"conectado al planificador."
+            )
+        if any(isinstance(c, ScoreExpr) for c in stmt.columns):
+            raise SQLRuntimeError("COSINE_SCORE()/BM25_SCORE() solo tienen sentido junto a un predicado MATCH")
+        for f in stmt.filters:
+            _validar_columna(schema, f.column, stmt.table)
 
-        if stmt.where is not None:
-            _validar_columna(schema, stmt.where.column, stmt.table)
+        if stmt.distance is not None:
+            return self._select_vector(stmt, sf, max_rows)
 
-        plan = self._plan(sf, stmt.table, stmt.where, "Select")
+        proyeccion, columnas = _projection(schema, stmt.columns, stmt.table)
+        orden = self._order_column(schema, stmt)
+        acceso, plan = self._choose_access(sf, stmt.table, stmt.filters, "Select")
+        residuales = [f for f in stmt.filters if f is not acceso]
+        if residuales:
+            plan.detail["residual_filters"] = [f.column for f in residuales]
 
-        limite = stmt.limit if stmt.limit is not None else None
-        sf.counter.reset()
+        # El LIMIT solo puede cortar el recorrido si nada lo reordena o descarta despues.
+        corte = stmt.limit if (orden is None and not residuales) else None
+        io = self._io_snapshot(sf, stmt.table)
+        filas_todas = (
+            row for row in self._rows_for(sf, acceso, plan, corte, table=stmt.table)
+            if all(_matches(schema, row, f) for f in residuales)
+        )
+        if orden is not None:
+            col_idx, desc = orden
+            filas_todas = iter(sorted(filas_todas, key=lambda r: r[col_idx], reverse=desc))
+            plan.detail["sort"] = f"{schema.columns[col_idx].name} {'DESC' if desc else 'ASC'} (en memoria)"
         filas: list[list[Any]] = []
         total = 0
-        for row in self._rows_for(sf, stmt.where, plan, limite, table=stmt.table):
+        for row in filas_todas:
+            if stmt.limit is not None and total >= stmt.limit:
+                break
             total += 1
             if len(filas) < max_rows:
                 filas.append([row[i] for i in proyeccion])
-        reads, writes = sf.counter.disk_reads, sf.counter.disk_writes
+        reads, writes = self._io_finish(io, plan)
 
         return QueryResult(
             columns=columnas,
@@ -316,6 +452,264 @@ class Executor:
             parse_ms=0.0,
             exec_ms=0.0,
             truncated=total > len(filas),
+        )
+
+    def _order_column(self, schema: Schema, stmt: Select) -> tuple[int, bool] | None:
+        if stmt.order_by is None:
+            return None
+        _validar_columna(schema, stmt.order_by.key, stmt.table)
+        idx = next(i for i, c in enumerate(schema.columns) if c.name.lower() == stmt.order_by.key.lower())
+        if schema.columns[idx].type is ColumnType.VECTOR:
+            raise SQLRuntimeError("no se puede ordenar por un VECTOR; usa una distancia (<-> o <=>)")
+        return idx, stmt.order_by.descending
+
+    def _choose_access(self, sf, table: str, filters: list[Condition], kind: str):
+        """Entre varios predicados, el que admite la ruta de acceso mas barata."""
+        if not filters:
+            return None, self._plan(sf, table, None, kind)
+        candidatos = [(f, self._plan(sf, table, f, kind)) for f in filters]
+        return min(candidatos, key=lambda fp: _ACCESS_RANK.get(fp[1].access, 5))
+
+    # ------------------------------------------------ telemetria indice/tabla
+
+    def _index_counters(self, table: str) -> list:
+        counters = []
+        for info in self.catalog.indexes_of(table):
+            if info.get("implicit"):
+                continue
+            idx = self.catalog.open_index(table, info["name"])
+            if hasattr(idx, "counter"):
+                counters.append(idx.counter)
+            else:  # ExtendibleHash: un contador por archivo
+                counters.extend([idx.dir_pager.counter, idx.bkt_pager.counter])
+        return counters
+
+    def _io_snapshot(self, sf, table: str) -> dict:
+        counters = self._index_counters(table)
+        sf.counter.reset()
+        return {"sf": sf, "counters": counters,
+                "r0": sum(c.disk_reads for c in counters), "w0": sum(c.disk_writes for c in counters)}
+
+    def _io_finish(self, io: dict, plan: Plan) -> tuple[int, int]:
+        sf, counters = io["sf"], io["counters"]
+        idx_r = sum(c.disk_reads for c in counters) - io["r0"]
+        idx_w = sum(c.disk_writes for c in counters) - io["w0"]
+        plan.detail["io"] = {
+            "index_reads": idx_r, "table_reads": sf.counter.disk_reads,
+            "index_writes": idx_w, "table_writes": sf.counter.disk_writes,
+        }
+        return sf.counter.disk_reads + idx_r, sf.counter.disk_writes + idx_w
+
+    # ------------------------------------------------- consultas vectoriales
+
+    def _select_vector(self, stmt: Select, sf, max_rows: int) -> QueryResult:
+        schema = sf.schema
+        dist = stmt.distance
+        _validar_columna(schema, dist.column, stmt.table)
+        vcol = next(i for i, c in enumerate(schema.columns) if c.name.lower() == dist.column.lower())
+        col = schema.columns[vcol]
+        if col.type is not ColumnType.VECTOR:
+            raise SQLRuntimeError(f"«{col.name}» no es una columna VECTOR: no admite {dist.operator}")
+        try:
+            q = np.asarray(parse_vector(dist.vector, col.length), dtype=np.float32)
+        except ValueError as exc:
+            raise SQLRuntimeError(f"vector de consulta: {exc}") from None
+
+        # El ORDER BY puede nombrar la distancia por su alias o repetir la expresion.
+        ok = stmt.order_by
+        por_distancia = ok is not None and (
+            isinstance(ok.key, DistanceExpr)
+            or ok.key.lower() in {(dist.alias or "").lower(), dist.label.lower()}
+        )
+        if ok is not None and not por_distancia:
+            raise SQLRuntimeError(
+                "en una consulta vectorial el ORDER BY debe ser la distancia (o su alias)"
+            )
+        es_knn = por_distancia and not ok.descending and stmt.limit is not None
+
+        items, columnas = _vector_projection(schema, stmt.columns, dist, stmt.table)
+        ivf = self._ivf_for(stmt.table, col.name, dist.metric)
+        io = self._io_snapshot(sf, stmt.table)
+
+        if es_knn:
+            plan, resultados = self._knn(stmt, sf, vcol, q, dist, ivf)
+        else:
+            plan, resultados = self._vector_full(stmt, sf, vcol, q, dist, por_distancia)
+
+        filas = []
+        for d, row in resultados[:max_rows]:
+            filas.append([round(d, 6) if it == "__dist__" else _jsonable(row[it]) for it in items])
+        reads, writes = self._io_finish(io, plan)
+        return QueryResult(
+            columns=columnas, rows=filas, row_count=len(resultados), plan=plan,
+            disk_reads=reads, disk_writes=writes, parse_ms=0.0, exec_ms=0.0,
+            truncated=len(resultados) > len(filas),
+        )
+
+    def _ivf_for(self, table: str, column: str, metric: str) -> tuple[dict, IVFIndex] | None:
+        for info in self.catalog.indexes_of(table):
+            if info["kind"] == "IVF" and info["column"].lower() == column.lower() and info["metric"] == metric:
+                return info, self.catalog.open_index(table, info["name"])
+        return None
+
+    def _vector_full(self, stmt, sf, vcol, q, dist, ordenar):
+        """Sin LIMIT (o con DESC) no hay k-NN: se calcula la distancia de todas las
+        filas que cumplen el WHERE y, si se pidio, se ordena."""
+        acceso, plan = self._choose_access(sf, stmt.table, stmt.filters, "Select")
+        residuales = [f for f in stmt.filters if f is not acceso]
+        filas = [r for r in self._rows_for(sf, acceso, plan, None, table=stmt.table)
+                 if all(_matches(sf.schema, r, f) for f in residuales)]
+        from backend.vector.distance import distances
+        d = distances(q, np.asarray([r[vcol] for r in filas], dtype=np.float32), dist.metric) if filas else []
+        res = list(zip([float(x) for x in d], filas))
+        if ordenar:
+            res.sort(key=lambda e: e[0], reverse=stmt.order_by.descending)
+        if stmt.limit is not None:
+            res = res[: stmt.limit]
+        plan.detail["vector"] = {"metric": dist.metric, "mode": "distancia exacta por fila"}
+        return plan, res
+
+    def _knn(self, stmt, sf, vcol, q, dist, ivf):
+        table, k, filtros = stmt.table, stmt.limit, stmt.filters
+        P = max(1, sf.page_count)
+        base = {"pages": P, "engine": self.catalog.engine_of(table),
+                "vector": {"metric": dist.metric, "k": k, "column": sf.schema.columns[vcol].name}}
+        acceso, pre_plan = self._choose_access(sf, table, filtros, "Select")
+        indexable = acceso is not None and pre_plan.access != "SeqScan"
+
+        if not filtros:
+            estrategia = "IVF" if ivf else "SEQ"
+        elif ivf is None:
+            estrategia = "PRE" if indexable else "SEQ"
+        elif not indexable:
+            estrategia = "POST"
+        else:
+            forzada = self.settings["hybrid.strategy"]
+            if forzada in ("PRE", "POST"):
+                estrategia, razon = forzada, f"forzada con SET hybrid.strategy = {forzada}"
+            else:
+                est = self._estimate(sf, table, acceso, pre_plan, k, ivf[1])
+                estrategia, razon = choose_strategy(est)
+                base["estimate"] = est.as_dict()
+            base["decision"] = razon
+
+        if estrategia in ("SEQ", "PRE"):
+            residuales = [f for f in filtros if f is not acceso] if estrategia == "PRE" else filtros
+            fuente = self._rows_for(sf, acceso if estrategia == "PRE" else None,
+                                    pre_plan if estrategia == "PRE" else self._plan(sf, table, None, "Select"),
+                                    None, table=table)
+            candidatas = (r for r in fuente if all(_matches(sf.schema, r, f) for f in residuales))
+            res = knn_linear(candidatas, lambda r: r[vcol], q, dist.metric, k)
+            if estrategia == "SEQ":
+                plan = Plan("KnnSeqScan", table,
+                            f"k-NN exacto: recorre las {P} páginas, calcula la distancia "
+                            f"{dist.metric} de cada fila{' que cumple el WHERE' if filtros else ''} "
+                            f"y conserva las {k} mejores en un Max-Heap.",
+                            estimated_reads=P, detail=base)
+            else:
+                plan = Plan("PreFilter", table,
+                            f"Pre-filtering: {pre_plan.access} sobre «{acceso.column}» entrega solo "
+                            f"las filas que cumplen el filtro y sobre ellas se hace k-NN exacto "
+                            f"(Max-Heap de {k}).",
+                            detail={**base, "prefilter_access": pre_plan.access,
+                                    **{k_: v for k_, v in pre_plan.detail.items() if k_ in ("index_name", "kind")}})
+            return plan, [(d, r) for d, r in res]
+
+        info, idx = ivf
+        return self._ivf_scan(stmt, sf, vcol, q, idx, info, base, estrategia == "POST")
+
+    def _ivf_scan(self, stmt, sf, vcol, q, idx: IVFIndex, info, base, post: bool):
+        table, k = stmt.table, stmt.limit
+        probes = max(1, min(self.settings["ivf.probes"], idx.n_lists))
+        orden = idx.probe_order(q)
+        escaneadas, ampliaciones, revisados, obsoletos = 0, 0, 0, 0
+        aceptadas: list[tuple[float, tuple]] = []
+        lote = probes
+        while escaneadas < len(orden):
+            cands = idx.scan_lists(q, orden[escaneadas : escaneadas + lote])
+            escaneadas += lote
+            for c in cands:
+                # Los candidatos llegan ordenados por distancia: los primeros k que
+                # pasan el filtro son el top-k de las celdas escaneadas.
+                if len(aceptadas) >= k:
+                    break
+                row, stale = self._fetch_candidate(sf, table, c)
+                revisados += 1
+                obsoletos += stale
+                if row is None:
+                    continue
+                if post and not all(_matches(sf.schema, row, f) for f in stmt.filters):
+                    continue
+                aceptadas.append((c.distance, row))
+            if len(aceptadas) >= k or not post:
+                break
+            # Post-filtering con filtro muy selectivo: no alcanzaron las k filas.
+            # Se duplica el sondeo sobre las celdas siguientes (iterative deepening).
+            ampliaciones += 1
+            lote *= 2
+        aceptadas.sort(key=lambda e: e[0])
+        detalle = {**base, "index_name": info["name"], "n_lists": idx.n_lists,
+                   "probes": probes, "lists_scanned": min(escaneadas, len(orden)),
+                   "candidates_checked": revisados}
+        if ampliaciones:
+            detalle["expansions"] = ampliaciones
+        if obsoletos:
+            detalle["stale_rids"] = obsoletos
+        if post:
+            plan = Plan("PostFilter", table,
+                        f"Post-filtering: el IVF «{info['name']}» propone candidatos en orden de "
+                        f"distancia ({probes} de {idx.n_lists} celdas) y a cada uno se le aplica el "
+                        f"WHERE hasta reunir {k}"
+                        + (f"; hubo que ampliar el sondeo {ampliaciones} vez/veces." if ampliaciones else "."),
+                        detail=detalle)
+        else:
+            plan = Plan("IVFScan", table,
+                        f"Búsqueda aproximada IVF «{info['name']}»: escanea solo las {probes} celdas "
+                        f"de Voronoi más cercanas de {idx.n_lists} (ivf.probes = {probes}).",
+                        estimated_reads=round(probes * idx.stats()["avg_pages_per_list"]) + k,
+                        detail=detalle)
+        return plan, aceptadas[:k]
+
+    def _fetch_candidate(self, sf, table: str, c) -> tuple[tuple | None, int]:
+        """Lee la fila de un candidato IVF verificando que el RID siga siendo suyo.
+
+        Devuelve (fila, 1 si el RID estaba obsoleto). Un RID queda obsoleto si la
+        tabla movio el registro (reorganizacion del Sequential, desplazamiento de
+        slots): en ese caso se recupera por clave primaria."""
+        try:
+            row = self.catalog.row_at(table, HashRID(c.rid.page_id, c.rid.slot, c.rid.area))
+        except (IndexError, ValueError):
+            row = None
+        if row is not None and sf.schema.key_of(row) == c.pk:
+            return row, 0
+        return sf.search(c.pk), 1
+
+    def _estimate(self, sf, table: str, cond: Condition, plan: Plan, k: int, ivf: IVFIndex) -> HybridEstimate:
+        """Cuenta las filas que cumplen `cond` recorriendo solo el indice
+        relacional, con un tope: el planificador paga unas pocas paginas de
+        indice para decidir con datos y no con una selectividad inventada."""
+        cap = max(ESTIMATE_CAP, 10 * k)
+        n = 0
+        detalle = plan.detail
+        if plan.access in ("IndexScan", "IndexRangeScan") and detalle.get("kind") == "HASH":
+            n = len(self.catalog.open_index(table, detalle["index_name"]).search(cond.lo))
+        elif plan.access in ("IndexScan", "IndexRangeScan"):
+            tree = self.catalog.open_index(table, detalle["index_name"])
+            lo = cond.lo if cond.lo is not None else _MIN
+            hi = cond.hi if cond.hi is not None else _MAX
+            for _ in tree.range_search(lo, hi):
+                n += 1
+                if n >= cap:
+                    break
+        else:  # BinarySearch / BinaryRangeScan sobre la clave del Sequential
+            for _ in self._rows_for(sf, cond, plan, cap, table=table):
+                n += 1
+        st = ivf.stats()
+        return HybridEstimate(
+            est_matches=min(n, cap), capped=n >= cap, n_rows=sf.n_records, k=k,
+            probes=max(1, min(self.settings["ivf.probes"], ivf.n_lists)),
+            n_lists=ivf.n_lists, avg_pages_per_list=st["avg_pages_per_list"],
+            rows_per_page=page_capacity(sf.page_size, sf.schema.record_size),
         )
 
     def _row_at(self, sf, rid):
@@ -527,6 +921,39 @@ def _matches(schema: Schema, row: tuple, where: Condition) -> bool:
         # Comparar CHAR con un numero, por ejemplo: el predicado no aplica.
         return False
     return True
+
+
+def _projection(schema: Schema, columns: list, tabla: str) -> tuple[list[int], list[str]]:
+    nombres = [c.name for c in schema.columns]
+    if not columns:
+        return list(range(len(nombres))), nombres
+    proyeccion = []
+    for col in columns:
+        _validar_columna(schema, col, tabla)
+        proyeccion.append(next(i for i, n in enumerate(nombres) if n.lower() == col.lower()))
+    return proyeccion, [nombres[i] for i in proyeccion]
+
+
+def _vector_projection(schema: Schema, columns: list, dist: DistanceExpr, tabla: str):
+    """Como _projection, pero la expresion de distancia se marca con '__dist__'."""
+    nombres = [c.name for c in schema.columns]
+    if not columns:
+        return list(range(len(nombres))) + ["__dist__"], nombres + [dist.label]
+    items, etiquetas = [], []
+    for col in columns:
+        if isinstance(col, DistanceExpr):
+            items.append("__dist__")
+            etiquetas.append(col.label)
+            continue
+        _validar_columna(schema, col, tabla)
+        i = next(i for i, n in enumerate(nombres) if n.lower() == col.lower())
+        items.append(i)
+        etiquetas.append(nombres[i])
+    return items, etiquetas
+
+
+def _jsonable(value):
+    return list(value) if isinstance(value, tuple) else value
 
 
 def _rid_of(sf, key):

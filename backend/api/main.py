@@ -267,6 +267,12 @@ def seed(table: str, req: SeedRequest) -> dict:
                     out.append(k % 100)
                 elif col.type is ColumnType.FLOAT:
                     out.append(round(1000 + (k % 9000) * 1.5, 2))
+                elif col.type is ColumnType.VECTOR:
+                    # Mezcla de 32 gaussianas: datos con estructura de clusters,
+                    # que es donde un IVF tiene algo que aprovechar.
+                    r = random.Random(k)
+                    centro = random.Random(1_000_003 * (k % 32))
+                    out.append(tuple(centro.gauss(0, 4) + r.gauss(0, 1) for _ in range(col.length)))
                 else:
                     out.append(f"{col.name[:3]}{k}"[: col.length])
             return tuple(out)
