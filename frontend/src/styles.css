@@ -323,6 +323,16 @@ button.primary:hover:not(:disabled) { background: #17465e; color: #fff; }
 .compare .num { font-family: var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
 
 /* El dato memorable: cuantas veces menos bloques costo la ruta elegida. */
+.plan-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: calc(var(--u) * 1) calc(var(--u) * 4);
+  margin: calc(var(--u) * 3) 0 0;
+  font-size: 13px;
+}
+.plan-facts dt { color: var(--ink-faint); }
+.plan-facts dd { margin: 0; font-family: var(--mono); }
+
 .ratio {
   margin-top: calc(var(--u) * 3);
   font-size: 13px;

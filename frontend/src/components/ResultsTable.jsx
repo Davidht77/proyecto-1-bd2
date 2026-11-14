@@ -1,3 +1,12 @@
+// Un VECTOR(128) en una celda es ilegible: se muestran los primeros componentes.
+function celda(v) {
+  if (Array.isArray(v)) {
+    const head = v.slice(0, 4).map((x) => x.toFixed(3)).join(', ')
+    return `[${head}${v.length > 4 ? `, … ${v.length}d` : ''}]`
+  }
+  return typeof v === 'number' ? v.toLocaleString('es') : v
+}
+
 export default function ResultsTable({ result, error }) {
   if (error) {
     const pendiente = error.kind === 'no_implementado'
@@ -53,7 +62,7 @@ export default function ResultsTable({ result, error }) {
           <tr key={i}>
             {fila.map((v, j) => (
               <td key={j} className={typeof v === 'number' ? 'num' : ''}>
-                {typeof v === 'number' ? v.toLocaleString('es') : v}
+                {celda(v)}
               </td>
             ))}
           </tr>
