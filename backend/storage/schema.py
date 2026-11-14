@@ -3,6 +3,11 @@
 Todos los tipos del Entregable 1 (INT, FLOAT, CHAR(n)) tienen ancho fijo, lo
 que permite que el slot `i` de una pagina viva siempre en el mismo offset y
 que la busqueda binaria intra-pagina sea aritmetica pura.
+
+Entregable 2 agrega VECTOR(D): D float32 contiguos (4*D bytes). Sigue siendo
+de ancho fijo, asi que toda la maquinaria de paginas, bitmap y RID funciona
+igual. struct aplana los D componentes en la tupla; pack/unpack los
+reagrupan para que la capa superior vea un solo valor por columna.
 """
 
 from __future__ import annotations
@@ -17,6 +22,29 @@ class ColumnType(IntEnum):
     INT = 1
     FLOAT = 2
     CHAR = 3
+    VECTOR = 4  # length = dimension D; cada componente es float32
+
+
+def parse_vector(value, dim: int | None = None) -> tuple[float, ...]:
+    """Normaliza un literal vectorial: '[0.1, -2, 3e-1]', lista o tupla.
+
+    Es el formato del enunciado (`embedding <=> '[0.12, -0.34, ...]'`), que
+    llega al motor como un string SQL comun.
+    """
+    if isinstance(value, str):
+        texto = value.strip()
+        if not (texto.startswith("[") and texto.endswith("]")):
+            raise ValueError(f"un vector se escribe como '[x1, x2, ...]', no {value[:30]!r}")
+        cuerpo = texto[1:-1].strip()
+        try:
+            out = tuple(float(x) for x in cuerpo.split(",")) if cuerpo else ()
+        except ValueError as exc:
+            raise ValueError(f"componente no numerico en el vector: {exc}") from None
+    else:
+        out = tuple(float(x) for x in value)
+    if dim is not None and len(out) != dim:
+        raise ValueError(f"se esperaba un vector de dimension {dim}, llego uno de {len(out)}")
+    return out
 
 
 @dataclass(frozen=True)
@@ -28,6 +56,8 @@ class Column:
     def __post_init__(self) -> None:
         if self.type is ColumnType.CHAR and self.length <= 0:
             raise ValueError(f"CHAR requiere longitud positiva: {self.name}")
+        if self.type is ColumnType.VECTOR and not 0 < self.length <= 4096:
+            raise ValueError(f"VECTOR requiere una dimension entre 1 y 4096: {self.name}")
         if len(self.name.encode("utf-8")) > 32:
             raise ValueError(f"nombre de columna demasiado largo: {self.name}")
 
@@ -37,6 +67,8 @@ class Column:
             return 4
         if self.type is ColumnType.FLOAT:
             return 8
+        if self.type is ColumnType.VECTOR:
+            return 4 * self.length
         return self.length
 
     @property
@@ -45,6 +77,8 @@ class Column:
             return "i"
         if self.type is ColumnType.FLOAT:
             return "d"
+        if self.type is ColumnType.VECTOR:
+            return f"{self.length}f"
         return f"{self.length}s"
 
 
@@ -59,6 +93,9 @@ class Schema:
 
         self.columns: tuple[Column, ...] = tuple(columns)
         self.pk_index = pk_index
+        if self.pk_column.type is ColumnType.VECTOR:
+            raise ValueError("un VECTOR no puede ser clave primaria")
+        self._has_vector = any(c.type is ColumnType.VECTOR for c in self.columns)
 
         # El prefijo "<" fija little-endian y desactiva el padding de alineacion,
         # de modo que record_size es exactamente la suma de los anchos.
@@ -88,6 +125,9 @@ class Schema:
                         f"valor de {col.name} excede CHAR({col.length}): {len(raw)} bytes"
                     )
                 encoded.append(raw)
+            elif col.type is ColumnType.VECTOR:
+                # struct espera los D componentes como argumentos sueltos.
+                encoded.extend(parse_vector(value, col.length))
             elif col.type is ColumnType.INT:
                 encoded.append(int(value))
             else:
@@ -97,6 +137,20 @@ class Schema:
     def unpack(self, raw: bytes) -> tuple:
         values = self._struct.unpack(bytes(raw[: self.record_size]))
         out = []
+        if self._has_vector:
+            # struct devolvio los D componentes sueltos: se reagrupan por columna.
+            i = 0
+            for col in self.columns:
+                if col.type is ColumnType.VECTOR:
+                    out.append(values[i : i + col.length])
+                    i += col.length
+                    continue
+                value = values[i]
+                i += 1
+                if col.type is ColumnType.CHAR:
+                    value = value.split(b"\x00", 1)[0].decode("utf-8")
+                out.append(value)
+            return tuple(out)
         for col, value in zip(self.columns, values):
             if col.type is ColumnType.CHAR:
                 out.append(value.split(b"\x00", 1)[0].decode("utf-8"))
