@@ -5,7 +5,7 @@ Capa de memoria secundaria y organización **Sequential File**.
 ## Levantar el sistema
 
 ```bash
-pip install fastapi uvicorn pydantic pytest snowballstemmer
+pip install fastapi uvicorn pydantic pytest snowballstemmer numpy
 cd frontend && npm install && npm run build && cd ..
 python -m uvicorn backend.api.main:app --port 8000
 ```
@@ -94,6 +94,79 @@ Documentación interactiva en `/docs`.
 React + Vite. Cuatro paneles: explorador de tablas, editor SQL, visor de resultados y
 plan de ejecución con métricas de I/O. Incluye un mapa de páginas físicas que dibuja la
 ocupación real de cada bloque y sus cadenas de overflow.
+
+## Proyecto 2 — Búsqueda vectorial ANN y motor SQL híbrido
+
+Enunciado 5.3 (búsqueda exacta + IVF en disco) y 5.4 (gramática multimodal y
+planificador híbrido). Código en `backend/vector/` y `backend/engine/`.
+
+### SQL
+
+```sql
+CREATE TABLE multimedia (id INT PRIMARY KEY, categoria CHAR(20), precio FLOAT,
+                         embedding VECTOR(128)) USING HEAP;
+INSERT INTO multimedia VALUES (1, 'footwear', 120.0, '[0.12, -0.34, ...]');
+CREATE INDEX idx_precio ON multimedia (precio) USING BTREE;
+CREATE INDEX idx_vec ON multimedia (embedding) USING IVF WITH (lists = 100, metric = 'COSINE');
+
+SET ivf.probes = 5;                 -- celdas que escanea el IVF
+SET hybrid.strategy = 'AUTO';       -- AUTO | PRE | POST (forzar, para experimentos)
+
+SELECT id, categoria, precio, embedding <=> '[0.12, -0.34, ...]' AS dist_coseno
+FROM multimedia
+WHERE categoria = 'footwear' AND precio <= 250.0
+ORDER BY dist_coseno ASC LIMIT 5;
+```
+
+`<->` es distancia L2 y `<=>` distancia coseno (1 − cos θ). El `WHERE` ahora admite
+varios predicados sobre columnas distintas: el planificador resuelve uno con la mejor
+ruta de acceso y evalúa el resto como filtro residual. También hay `ORDER BY <col>`.
+
+### Rutas de acceso vectoriales
+
+| Situación | Ruta | Qué hace |
+|---|---|---|
+| sin `WHERE`, sin IVF | `KnnSeqScan` | k-NN exacto, Max-Heap de tamaño k |
+| sin `WHERE`, con IVF | `IVFScan` | escanea las `ivf.probes` celdas más cercanas |
+| `WHERE` indexable, sin IVF | `PreFilter` | B+/Hash/clave entrega candidatos → k-NN exacto |
+| `WHERE` no indexable, con IVF | `PostFilter` | candidatos IVF en orden → filtro; amplía el sondeo si no alcanza |
+| `WHERE` indexable y con IVF | `PreFilter` / `PostFilter` | decide `hybrid.choose_strategy` con un conteo real del índice |
+
+Cada consulta reporta en `plan.io` las lecturas **del índice** y **de la tabla** por
+separado (enunciado 5.4). El panel de métricas del cliente web las dibuja.
+
+### Diseño en disco del IVF
+
+| Archivo | Registro | Metadatos |
+|---|---|---|
+| `<t>__<idx>.ivf.dir` | `⟨centroide VECTOR(D), cluster_id, head, tail, count⟩` | `user_a` = métrica, `user_b` = C |
+| `<t>__<idx>.ivf.lst` | `⟨pk, page, slot, area, vec⟩`, cadena de páginas por celda | `user_a` = N |
+
+- C = ⌊√N⌋ por defecto (K-Means++ / Lloyd; esférico con `COSINE`).
+- Las listas son densas: una página se decodifica de una vez con `numpy.frombuffer`.
+- Se guarda la **PK junto al RID** porque en este motor los RID no son estables
+  (move-the-last del Heap, inserción ordenada y `reorganize()` del Sequential). Al leer
+  un candidato se verifica la PK; si el RID quedó obsoleto, se recupera por clave
+  (`plan.stale_rids`). El `DELETE` sobre Heap además reubica la fila movida en el IVF.
+- Los centroides viven en RAM después de abrir el índice (se leen una vez).
+
+### Experimento 8
+
+```bash
+python -m backend.benchmarks.experiment8                  # sintético, N=20k, D=128
+python -m backend.benchmarks.experiment8 --npy emb.npy    # embeddings reales (N, D)
+```
+
+Escribe `benchmarks/results/exp8_ann.csv` (Recall@10 / ms / bloques vs `probes`, con el
+k-NN exacto como verdad de campo) y `exp8_hibrido.csv` (PRE vs POST según selectividad).
+
+### Contrato para los módulos textual y espacial
+
+`MATCH '<consulta>'`, `WITHIN_RADIUS((x, y), r)`, `COSINE_SCORE()` y
+`CREATE INDEX ... USING RTREE | INVERTED` ya se parsean (`TextMatch`, `SpatialRadius`,
+`ScoreExpr` en `parser.py`). Hoy el executor responde 501 con el detalle. Para
+conectarlos: registrar el índice en `Catalog.indexes_of()` y reemplazar el
+`NotImplementedFeature` del inicio de `Executor._select`.
 
 ## Contrato con el resto del equipo
 
