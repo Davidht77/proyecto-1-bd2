@@ -26,6 +26,7 @@ Este modulo no hace I/O: recibe estimaciones ya calculadas y decide.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 
 
@@ -57,9 +58,46 @@ class HybridEstimate:
         return asdict(self)
 
 
+def estimate_costs(est: HybridEstimate) -> tuple[float, float]:
+    """Bloques de disco que leeria cada estrategia: (costo_pre, costo_post).
+
+    PRE   una lectura de tabla por fila que cumple el filtro: el indice
+          relacional no es clustered, asi que filas vecinas en el indice caen
+          en paginas distintas de la tabla.
+
+    POST  con selectividad s, para juntar k aciertos hay que revisar ~k/s
+          candidatos (una lectura de tabla cada uno, para evaluar el WHERE).
+          Esos candidatos salen de las listas mas cercanas: cada lista aporta
+          ~n_rows/n_lists vectores y cuesta avg_pages_per_list lecturas. Nunca
+          se recorren menos de `probes` listas ni mas de `n_lists`. Si el
+          filtro deja pasar menos de k filas, POST termina recorriendo todo.
+    """
+    n_rows = max(1, est.n_rows)
+    n_lists = max(1, est.n_lists)
+    costo_pre = float(est.est_matches)
+
+    if est.est_matches == 0:
+        candidatos = n_rows
+    else:
+        candidatos = min(n_rows, math.ceil(est.k * n_rows / est.est_matches))
+    por_lista = n_rows / n_lists
+    listas = min(n_lists, max(est.probes, math.ceil(candidatos / por_lista)))
+    costo_post = listas * est.avg_pages_per_list + candidatos
+    return costo_pre, costo_post
+
+
 def choose_strategy(est: HybridEstimate) -> tuple[str, str]:
     """Devuelve ("PRE" | "POST", razon legible para el panel del plan).
 
-    TODO(contribucion): implementar el modelo de costos que elige la estrategia.
+    Minimiza bloques leidos, la metrica que reporta el DiskCounter. Ante un
+    empate gana PRE: cuesta lo mismo y su resultado es exacto, mientras que
+    POST hereda el recall aproximado del IVF.
     """
-    raise NotImplementedError("choose_strategy: falta el modelo de costos PRE vs POST")
+    pre, post = estimate_costs(est)
+    sel = est.est_matches / max(1, est.n_rows)
+    cota = ">=" if est.capped else "~"
+    datos = (f"{cota}{est.est_matches} filas cumplen el filtro ({sel:.1%}); "
+             f"PRE {cota}{pre:,.0f} bloques vs POST ~{post:,.0f}")
+    if pre <= post:
+        return "PRE", f"{datos}: conviene filtrar primero (y es exacto)"
+    return "POST", f"{datos}: conviene recorrer el IVF y filtrar despues"
