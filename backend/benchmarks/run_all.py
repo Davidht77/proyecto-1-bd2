@@ -11,7 +11,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-from backend.benchmarks import experiment1, experiment2, experiment3, experiment4
+from backend.benchmarks import experiment1, experiment2, experiment3, experiment4, experiment5
 
 RESULTS_DIR = Path("benchmarks/results")
 
@@ -44,6 +44,13 @@ def main() -> None:
         elapsed = time.perf_counter() - t0
         print(f"[{nombre}] listo en {elapsed:.1f}s", flush=True)
         _volcar(nombre, resultados)
+
+    print("[exp5_espacial] arrancando...", flush=True)
+    t0 = time.perf_counter()
+    filas5 = experiment5.run()
+    for path in experiment5.write_csvs(filas5, RESULTS_DIR):
+        print(f"  -> {path} ({len(filas5)} filas)", flush=True)
+    print(f"[exp5_espacial] listo en {time.perf_counter() - t0:.1f}s", flush=True)
 
 
 if __name__ == "__main__":

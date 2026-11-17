@@ -34,6 +34,7 @@ from backend.index.btree import BPlusTree
 from backend.index.btree import RID as BTreeRID
 from backend.index.hash import ExtendibleHash
 from backend.index.hash import RID as HashRID
+from backend.index.rtree import RTree, RTreeRID
 from backend.storage.pager import peek_header
 from backend.storage.schema import Column, ColumnType, Schema
 from backend.structures.heap_file import HeapFile
@@ -95,7 +96,9 @@ class Catalog:
         self.page_size = page_size
         self.cache_size = cache_size
         self._open: dict[str, SequentialFile] = {}
-        self._open_indexes: dict[tuple[str, str], ExtendibleHash | BPlusTree | IVFIndex] = {}
+        self._open_indexes: dict[
+            tuple[str, str], ExtendibleHash | BPlusTree | IVFIndex | RTree
+        ] = {}
 
     # ------------------------------------------------------------- rutas
 
@@ -144,7 +147,7 @@ class Catalog:
     def create_index(
         self, table: str, index_name: str, column: str, kind: str, options: dict | None = None
     ) -> None:
-        if kind not in ("HASH", "BTREE", "IVF"):
+        if kind not in ("HASH", "BTREE", "IVF", "RTREE"):
             raise NotImplementedFeature(f"CREATE INDEX ... USING {kind} todavía no está implementado.")
         if self._engine_of(table) is None:
             raise TableNotFound(f"la tabla «{table}» no existe")
@@ -157,6 +160,20 @@ class Catalog:
             raise ColumnNotFound(f"la columna «{column}» no existe en «{table}»")
         col_idx = f.schema.columns.index(col)
         base = self._index_base(table, index_name)
+
+        if kind == "RTREE":
+            if col.type is not ColumnType.POINT:
+                raise ColumnNotFound(
+                    f"RTREE solo indexa columnas POINT; «{col.name}» es {col.type.name}"
+                )
+            tree = RTree(base, col, page_size=self.page_size, cache_size=self.cache_size)
+            tree.bulk_load(
+                (row[col_idx], RTreeRID.from_engine_rid(rid))
+                for rid, row in f.scan_with_rid()
+            )
+            tree.flush()
+            self._open_indexes[(table, index_name)] = tree
+            return
 
         if kind == "IVF":
             self._create_ivf(f, base, col, col_idx, options or {})
@@ -235,6 +252,16 @@ class Catalog:
             idx = ExtendibleHash(base, header["schema"].columns[0], page_size=header["page_size"], cache_size=self.cache_size)
             self._open_indexes[key] = idx
             return idx
+        if Path(f"{base}.rtree.dat").exists():
+            header = peek_header(f"{base}.rtree.dat")
+            # La entrada del R-Tree mide 8*dim (MBR float32) + 10 (RID).
+            dim = max(1, (header["record_size"] - 10) // 8)
+            idx = RTree(
+                base, header["schema"].columns[0],
+                page_size=header["page_size"], cache_size=self.cache_size, dim=dim,
+            )
+            self._open_indexes[key] = idx
+            return idx
         path = Path(f"{base}.btree.dat")
         if not path.exists():
             raise TableNotFound(f"el indice «{index_name}» no existe en «{table}»")
@@ -252,7 +279,7 @@ class Catalog:
         self.close_index(table, index_name)
         base = self._index_base(table, index_name)
         for path in (Path(f"{base}.hash.dir"), Path(f"{base}.hash.bkt"), Path(f"{base}.btree.dat"),
-                     Path(f"{base}.ivf.dir"), Path(f"{base}.ivf.lst")):
+                     Path(f"{base}.ivf.dir"), Path(f"{base}.ivf.lst"), Path(f"{base}.rtree.dat")):
             if path.exists():
                 path.unlink()
 
@@ -378,6 +405,15 @@ class Catalog:
                 "kind": "IVF",
                 "implicit": False,
                 **{k: stats[k] for k in ("metric", "dim", "n_lists", "n_vectors")},
+            })
+        for path in self.data_dir.glob(f"{prefix}*.rtree.dat"):
+            index_name = path.name[len(prefix) : -len(".rtree.dat")]
+            header = peek_header(str(path))
+            out.append({
+                "name": index_name,
+                "column": header["schema"].columns[0].name,
+                "kind": "RTREE",
+                "implicit": False,
             })
         for path in self.data_dir.glob(f"{prefix}*.btree.dat"):
             index_name = path.name[len(prefix) : -len(".btree.dat")]

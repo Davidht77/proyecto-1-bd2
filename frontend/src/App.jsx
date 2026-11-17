@@ -4,6 +4,7 @@ import TableExplorer from './components/TableExplorer'
 import PlanMetrics from './components/PlanMetrics'
 import ResultsTable from './components/ResultsTable'
 import PageMap from './components/PageMap'
+import MapView from './components/MapView'
 
 const EJEMPLOS = [
   ['crear tabla', "CREATE TABLE empleados (\n  id INT PRIMARY KEY,\n  nombre CHAR(30),\n  dept CHAR(20),\n  salario FLOAT\n) USING SEQUENTIAL"],
@@ -12,6 +13,11 @@ const EJEMPLOS = [
   ['rango', 'SELECT * FROM empleados WHERE id >= 100 AND id <= 500'],
   ['escaneo completo', "SELECT * FROM empleados WHERE dept = 'Analytics'"],
   ['borrar', 'DELETE FROM empleados WHERE id = 101'],
+  ['crear tabla espacial', "CREATE TABLE locales (\n  id INT PRIMARY KEY,\n  nombre CHAR(20),\n  ubicacion POINT,\n  categoria CHAR(10)\n) USING HEAP"],
+  ['insertar punto', "INSERT INTO locales VALUES (1, 'Miraflores', POINT(-77.0282, -12.1354), 'tienda')"],
+  ['índice R-Tree', 'CREATE INDEX idx_geo ON locales (ubicacion) USING RTREE'],
+  ['radio', 'SELECT id, nombre, ubicacion FROM locales WHERE ubicacion WITHIN_RADIUS ((-77.0282, -12.1354), 2.5)'],
+  ['k-NN espacial', 'SELECT id, nombre, ubicacion FROM locales WHERE ubicacion KNN ((-77.0282, -12.1354), 10)'],
 ]
 
 const SQL_INICIAL = `CREATE TABLE empleados (
@@ -234,6 +240,11 @@ export default function App() {
                 <button aria-selected={tab === 'paginas'} onClick={() => setTab('paginas')}>
                   Mapa de páginas
                 </button>
+                {result?.spatial && (
+                  <button aria-selected={tab === 'mapa'} onClick={() => setTab('mapa')}>
+                    Mapa espacial
+                  </button>
+                )}
               </div>
               <span className="spacer" />
               {tab === 'resultados' && result?.columns?.length > 0 && (
@@ -248,10 +259,22 @@ export default function App() {
                   {selected} · {pages.total_pages} página{pages.total_pages === 1 ? '' : 's'}
                 </span>
               )}
+              {tab === 'mapa' && result?.spatial && (
+                <span className="count">
+                  {result.spatial.query?.kind === 'knn'
+                    ? `k=${result.spatial.query.k}`
+                    : `radio ${result.spatial.query?.radius_km} km`}
+                  {result.spatial.index_name
+                    ? ` · ${result.spatial.index_name}`
+                    : ' · sin índice'}
+                </span>
+              )}
             </header>
             <div className="scroll">
               {tab === 'resultados' ? (
                 <ResultsTable result={result} error={error} />
+              ) : tab === 'mapa' ? (
+                <MapView result={result} />
               ) : (
                 <PageMap data={pages} loading={loadingPages} />
               )}

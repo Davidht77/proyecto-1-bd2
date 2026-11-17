@@ -89,8 +89,8 @@ class BenchmarkRequest(BaseModel):
     experiment: int = Field(
         0, 
         ge=0, 
-        le=4, 
-        description="Número de experimento a correr (1, 2, 3, 4). 0 para correr todos (¡puede tardar mucho!)."
+        le=5,
+        description="Número de experimento a correr (1..5). 0 para correr todos (¡puede tardar mucho!)."
     )
 
 
@@ -126,6 +126,8 @@ def health() -> dict:
             "heap_file": True,
             "btree": True,
             "hash": True,
+            "rtree": True,
+            "spatial": True,
         },
     }
 
@@ -174,6 +176,11 @@ def reorganize(table: str) -> dict:
         antes = {"pages": sf.page_count, "overflow_records": sf.n_overflow}
         stats = sf.reorganize()
         sf.flush()
+        # La reorganizacion reescribe el archivo principal: los RID fisicos de
+        # los indices espaciales dejan de ser validos y hay que reindexar.
+        for info in [i for i in catalog.indexes_of(table) if i["kind"] == "RTREE"]:
+            catalog.drop_index(table, info["name"])
+            catalog.create_index(table, info["name"], info["column"], "RTREE")
         return {
             "table": table,
             "before": antes,
@@ -273,6 +280,13 @@ def seed(table: str, req: SeedRequest) -> dict:
                     r = random.Random(k)
                     centro = random.Random(1_000_003 * (k % 32))
                     out.append(tuple(centro.gauss(0, 4) + r.gauss(0, 1) for _ in range(col.length)))
+                elif col.type is ColumnType.POINT:
+                    # Puntos alrededor de Lima, para probar WITHIN_RADIUS/KNN.
+                    r = random.Random(k)
+                    out.append((
+                        round(-77.0282 + r.uniform(-0.15, 0.15), 6),
+                        round(-12.1354 + r.uniform(-0.12, 0.12), 6),
+                    ))
                 else:
                     out.append(f"{col.name[:3]}{k}"[: col.length])
             return tuple(out)
@@ -327,7 +341,8 @@ def seed(table: str, req: SeedRequest) -> dict:
 @app.post("/api/benchmarks/run")
 def run_benchmarks(req: BenchmarkRequest = BenchmarkRequest(experiment=0)) -> dict:
     import shutil
-    from backend.benchmarks import experiment1, experiment2, experiment3, experiment4
+    from dataclasses import asdict
+    from backend.benchmarks import experiment1, experiment2, experiment3, experiment4, experiment5
     
     bench_dir = Path(DATA_DIR) / "benchmarks"
     if bench_dir.exists():
@@ -348,7 +363,11 @@ def run_benchmarks(req: BenchmarkRequest = BenchmarkRequest(experiment=0)) -> di
         
     if req.experiment in (0, 4):
         resultados["experiment_4"] = experiment4.run(str(bench_dir / "exp4"))
-        
+
+    if req.experiment in (0, 5):
+        res5 = experiment5.run(str(bench_dir / "exp5"))
+        resultados["experiment_5"] = [asdict(r) for r in res5]
+
     return {
         "status": "ok",
         "results": resultados
@@ -357,14 +376,31 @@ def run_benchmarks(req: BenchmarkRequest = BenchmarkRequest(experiment=0)) -> di
 
 @app.get("/api/tables/{table}/index/{index_name}")
 def inspect_index(table: str, index_name: str) -> dict:
-    """PENDIENTE: inspeccion de un indice B+ o Hash (altura, fan-out, buckets)."""
+    """Inspeccion fisica de un indice. RTREE expone altura, MBR y nodos."""
+    try:
+        info = next(
+            (i for i in catalog.indexes_of(table) if i["name"] == index_name), None
+        )
+        if info is not None and info["kind"] == "RTREE":
+            tree = catalog.open_index(table, index_name)
+            stats = tree.inspect()
+            return {
+                "table": table,
+                "name": index_name,
+                "kind": "RTREE",
+                "column": info["column"],
+                **stats,
+                "nodes": tree.sample_nodes(200),
+            }
+    except EngineError as exc:
+        raise _http(exc) from exc
     raise HTTPException(
         501,
         {
             "error": "no_implementado",
-            "detail": "Los indices BTREE y HASH todavia no estan implementados. "
-            "El unico camino de acceso indexado disponible es la busqueda binaria "
-            "del Sequential File sobre su clave primaria.",
+            "detail": "La inspeccion detallada solo esta implementada para indices RTREE. "
+            "Los indices BTREE, HASH e IVF se inspeccionan desde el plan de ejecucion "
+            "y las metricas de I/O.",
             "missing": ["btree", "hash"],
         },
     )

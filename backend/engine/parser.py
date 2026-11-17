@@ -3,9 +3,10 @@
 Gramatica soportada (Entregable 1 + extension multimodal del Entregable 2, 5.4):
 
     CREATE TABLE <t> (<col> <tipo> [PRIMARY KEY], ...) [USING HEAP|SEQUENTIAL]
-        <tipo> := INT | FLOAT | CHAR(n) | VECTOR(d)
+        <tipo> := INT | FLOAT | CHAR(n) | VECTOR(d) | POINT
     DROP TABLE <t>
     INSERT INTO <t> VALUES (<v>, ...)          -- un vector se escribe '[x1, x2, ...]'
+                                                -- un punto se escribe POINT(x, y)
     SELECT <item>, ... FROM <t> [WHERE <pred> {AND <pred>}]
            [ORDER BY <clave> [ASC|DESC]] [LIMIT n]
         <item>  := * | <col> | <col> <-> '<vec>' [AS alias] | <col> <=> '<vec>' [AS alias]
@@ -19,6 +20,7 @@ Gramatica soportada (Entregable 1 + extension multimodal del Entregable 2, 5.4):
     <pred> := <col> = <v> | <col> <op> <v> | <col> BETWEEN <v> AND <v>
             | <col> MATCH '<consulta>'                     (modulo textual)
             | <col> WITHIN_RADIUS ((<x>, <y>), <r>)        (modulo espacial)
+            | <col> KNN ((<x>, <y>), <k>)                  (modulo espacial)
 
 Varios predicados sobre la misma columna se intersectan en un solo rango; los
 predicados sobre columnas distintas quedan en `filters` para que el
@@ -36,7 +38,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from backend.engine.errors import SQLSyntaxError
-from backend.storage.schema import Column, ColumnType, parse_vector
+from backend.storage.schema import Column, ColumnType, parse_point, parse_vector
 
 # --------------------------------------------------------------------- AST
 
@@ -104,6 +106,49 @@ class SpatialRadius:
     y: float
     radius: float
 
+    @property
+    def kind(self) -> str:
+        return "radius"
+
+    @property
+    def center(self) -> tuple[float, float]:
+        return (self.x, self.y)
+
+    @property
+    def radius_km(self) -> float:
+        return self.radius
+
+    @property
+    def k(self) -> None:
+        return None
+
+
+@dataclass
+class SpatialKNN:
+    """`<col> KNN ((x, y), k)`: k vecinos mas cercanos geograficos."""
+
+    column: str
+    x: float
+    y: float
+    k: int
+
+    @property
+    def kind(self) -> str:
+        return "knn"
+
+    @property
+    def center(self) -> tuple[float, float]:
+        return (self.x, self.y)
+
+    @property
+    def radius_km(self) -> None:
+        return None
+
+
+# Union usada por el ejecutor y los tests para referirse a cualquier predicado
+# espacial. `isinstance(pred, SpatialPredicate)` funciona en Python 3.10+.
+SpatialPredicate = SpatialRadius | SpatialKNN
+
 
 @dataclass
 class OrderBy:
@@ -138,7 +183,15 @@ class Select:
     limit: int | None = None
     filters: list[Condition] = field(default_factory=list)  # todos los predicados relacionales
     order_by: OrderBy | None = None
-    special: list = field(default_factory=list)  # TextMatch | SpatialRadius
+    special: list = field(default_factory=list)  # TextMatch | SpatialRadius | SpatialKNN
+
+    @property
+    def spatial(self):
+        """Primer predicado espacial (WITHIN_RADIUS o KNN), si lo hay."""
+        for pred in self.special:
+            if isinstance(pred, (SpatialRadius, SpatialKNN)):
+                return pred
+        return None
 
     @property
     def distance(self) -> DistanceExpr | None:
@@ -156,6 +209,7 @@ class Delete:
     table: str
     where: Condition | None = None
     filters: list[Condition] = field(default_factory=list)
+    special: list = field(default_factory=list)  # SpatialRadius | SpatialKNN
 
 
 @dataclass
@@ -285,6 +339,13 @@ class Parser:
         tok = self._next()
         if tok.kind in ("number", "string"):
             return tok.value
+        if tok.kind in ("ident", "keyword") and str(tok.value).upper() == "POINT":
+            self._expect("punct", "(")
+            x = self._number()
+            self._expect("punct", ",")
+            y = self._number()
+            self._expect("punct", ")")
+            return parse_point((x, y))
         raise SQLSyntaxError(f"se esperaba un valor literal, se encontro {tok.value!r}")
 
     # -- entrada ------------------------------------------------------------
@@ -362,17 +423,19 @@ class Parser:
                     raise SQLSyntaxError(f"VECTOR necesita una dimension entera entre 1 y 4096, no {dim}")
                 self._expect("punct", ")")
                 col = Column(name, ColumnType.VECTOR, dim)
+            elif tipo == "POINT":
+                col = Column(name, ColumnType.POINT)
             else:
                 raise SQLSyntaxError(
-                    f"tipo no soportado: {tipo}. Usa INT, FLOAT, CHAR(n) o VECTOR(d)."
+                    f"tipo no soportado: {tipo}. Usa INT, FLOAT, CHAR(n), VECTOR(d) o POINT."
                 )
 
             if self._accept("keyword", "PRIMARY"):
                 self._expect("keyword", "KEY")
                 if pk_index is not None:
                     raise SQLSyntaxError("la tabla solo puede tener una PRIMARY KEY")
-                if col.type is ColumnType.VECTOR:
-                    raise SQLSyntaxError("un VECTOR no puede ser PRIMARY KEY")
+                if col.type in (ColumnType.VECTOR, ColumnType.POINT):
+                    raise SQLSyntaxError(f"un {col.type.name} no puede ser PRIMARY KEY")
                 pk_index = len(columns)
 
             columns.append(col)
@@ -390,9 +453,10 @@ class Parser:
 
         if pk_index is None:
             pk_index = 0  # por convencion, la primera columna
-            if columns[0].type is ColumnType.VECTOR:
+            if columns[0].type in (ColumnType.VECTOR, ColumnType.POINT):
                 raise SQLSyntaxError(
-                    "la primera columna es un VECTOR: declara explicitamente la PRIMARY KEY"
+                    f"la primera columna es un {columns[0].type.name}: declara explícitamente "
+                    "la PRIMARY KEY"
                 )
 
         return CreateTable(table, columns, pk_index, engine)
@@ -523,9 +587,10 @@ class Parser:
         self._expect("keyword", "FROM")
         table = self._expect_name()
         filters, special = self._where()
-        if special:
-            raise SQLSyntaxError("DELETE no admite predicados MATCH ni WITHIN_RADIUS")
-        return Delete(table, filters[0] if filters else None, filters)
+        if any(isinstance(p, TextMatch) for p in special):
+            raise SQLSyntaxError("DELETE no admite predicados MATCH")
+        espaciales = [p for p in special if isinstance(p, (SpatialRadius, SpatialKNN))]
+        return Delete(table, filters[0] if filters else None, filters, espaciales)
 
     # -- WHERE --------------------------------------------------------------
 
@@ -575,7 +640,24 @@ class Parser:
             self._expect("punct", ",")
             r = self._number()
             self._expect("punct", ")")
+            if r <= 0:
+                raise SQLSyntaxError(f"el radio debe ser positivo, no {r}")
             return SpatialRadius(column, x, y, r)
+
+        if tok and tok.kind == "ident" and str(tok.value).upper() == "KNN":
+            self._next()
+            self._expect("punct", "(")
+            self._expect("punct", "(")
+            x = self._number()
+            self._expect("punct", ",")
+            y = self._number()
+            self._expect("punct", ")")
+            self._expect("punct", ",")
+            k = self._expect("number").value
+            self._expect("punct", ")")
+            if not isinstance(k, int) or k <= 0:
+                raise SQLSyntaxError(f"KNN necesita un k entero positivo, no {k}")
+            return SpatialKNN(column, x, y, k)
 
         op = self._expect("op").value
         value = self._value()

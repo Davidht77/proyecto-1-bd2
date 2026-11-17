@@ -1,4 +1,4 @@
-"""Corre los 4 experimentos del enunciado (seccion 4) a escala real, uno
+"""Corre los experimentos del enunciado (secciones 4 y 5.1) a escala real, uno
 por proceso del sistema operativo en paralelo, para aprovechar los nucleos
 disponibles en vez de la ejecucion serial de run_all.py.
 
@@ -49,6 +49,12 @@ elif modulo == "exp4":
     from backend.benchmarks import experiment4 as exp
     filas = exp.run()
     nombre = "exp4_bloque"
+elif modulo == "exp5":
+    from backend.benchmarks import experiment5 as exp
+    filas = exp.run()
+    exp.write_csvs(filas, RESULTS_DIR)
+    print(f"[exp5] listo -> {len(filas)} filas en dos CSV", flush=True)
+    raise SystemExit(0)
 else:
     raise SystemExit(f"modulo desconocido: {modulo}")
 
@@ -88,7 +94,7 @@ def _fusionar_exp1(n_values: list[int]) -> None:
 
 def main() -> None:
     n_values = list(experiment1.N_VALUES)
-    tareas = [["exp1", str(n)] for n in n_values] + [["exp2"], ["exp3"], ["exp4"]]
+    tareas = [["exp1", str(n)] for n in n_values] + [["exp2"], ["exp3"], ["exp4"], ["exp5"]]
 
     t0 = time.perf_counter()
     procesos = [subprocess.Popen([sys.executable, "-c", _WORKER, *tarea]) for tarea in tareas]

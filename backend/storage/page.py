@@ -39,6 +39,8 @@ class PageType(IntEnum):
     BT_INTERNAL = 3
     BT_LEAF = 4
     HASH = 5
+    RT_INTERNAL = 6
+    RT_LEAF = 7
 
 
 def page_capacity(page_size: int, record_size: int) -> int:

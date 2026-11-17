@@ -31,12 +31,20 @@ SELECT * FROM empleados WHERE id >= 100 AND id <= 500;  -- recorrido por rango
 SELECT * FROM empleados WHERE nombre = 'Ada';           -- escaneo secuencial
 DELETE FROM empleados WHERE id = 101;
 DROP TABLE empleados;
+
+-- módulo espacial
+CREATE TABLE locales (id INT PRIMARY KEY, nombre CHAR(20), ubicacion POINT) USING HEAP;
+INSERT INTO locales VALUES (1, 'Miraflores', POINT(-77.0282, -12.1354));
+CREATE INDEX idx_geo ON locales (ubicacion) USING RTREE;
+SELECT * FROM locales WHERE ubicacion WITHIN_RADIUS ((-77.0282, -12.1354), 2.5);
+SELECT * FROM locales WHERE ubicacion KNN ((-77.0282, -12.1354), 10);
 ```
 
 `USING HEAP` y `USING SEQUENTIAL` funcionan. `CREATE INDEX ... USING HASH` construye
 un Hashing Dinámico sobre disco y habilita `IndexScan` en el planificador.
-`CREATE INDEX ... USING BTREE` se parsea, pero devuelve 501: el árbol B+ sigue
-pendiente.
+`CREATE INDEX ... USING BTREE` construye el árbol B+; `USING RTREE` indexa columnas
+`POINT`. `MATCH`, `WITHIN_RADIUS` y `KNN` se parsean; los predicados espaciales ya
+se ejecutan y `MATCH` sigue pendiente del módulo textual.
 
 ## API REST
 
@@ -50,7 +58,7 @@ pendiente.
 | `POST` | `/api/tables/{t}/seed` | funcionando — carga de datos sintéticos |
 | `GET` | `/api/health` | funcionando |
 | `POST` | `/api/benchmarks/run` | **501** — necesita B+ (usa Heap/Sequential/Hash mientras tanto) |
-| `GET` | `/api/tables/{t}/index/{n}` | **501** — inspección de índice, aún no implementada |
+| `GET` | `/api/tables/{t}/index/{n}` | funcionando para `RTREE` (altura, MBR y nodos); 501 para el resto |
 
 Documentación interactiva en `/docs`.
 
@@ -79,6 +87,8 @@ Documentación interactiva en `/docs`.
 |---|---|---|
 | `btree.py` | Árbol B+ multinivel en disco | **pendiente** |
 | `hash.py` | Extendible Hashing | listo (sebastian) |
+| `rtree.py` | R-Tree espacial persistido (MBR, split cuadrático, k-NN) | listo |
+| `geo.py` | Haversine, caja de radio y `MINDIST` geográfico | listo |
 
 ### `backend/engine/` — motor de consultas
 
@@ -160,13 +170,52 @@ python -m backend.benchmarks.experiment8 --npy emb.npy    # embeddings reales (N
 Escribe `benchmarks/results/exp8_ann.csv` (Recall@10 / ms / bloques vs `probes`, con el
 k-NN exacto como verdad de campo) y `exp8_hibrido.csv` (PRE vs POST según selectividad).
 
-### Contrato para los módulos textual y espacial
+### Módulo espacial (R-Tree)
 
-`MATCH '<consulta>'`, `WITHIN_RADIUS((x, y), r)`, `COSINE_SCORE()` y
-`CREATE INDEX ... USING RTREE | INVERTED` ya se parsean (`TextMatch`, `SpatialRadius`,
-`ScoreExpr` en `parser.py`). Hoy el executor responde 501 con el detalle. Para
-conectarlos: registrar el índice en `Catalog.indexes_of()` y reemplazar el
-`NotImplementedFeature` del inicio de `Executor._select`.
+El R-Tree se persiste en `<tabla>__<indice>.rtree.dat` sobre la misma cabecera de
+página de 32 B. Cada entrada es `MBR (2·D float32) + RID (page_id, slot, area)`;
+`root_page_id` y `height` viven en `user_a`/`user_b`.
+
+```sql
+CREATE TABLE locales (id INT PRIMARY KEY, nombre CHAR(20), ubicacion POINT) USING HEAP;
+INSERT INTO locales VALUES (1, 'Miraflores', POINT(-77.0282, -12.1354));
+CREATE INDEX idx_geo ON locales (ubicacion) USING RTREE;
+
+SELECT id, ubicacion FROM locales
+WHERE ubicacion WITHIN_RADIUS ((-77.0282, -12.1354), 2.5);
+
+SELECT id, ubicacion FROM locales
+WHERE ubicacion KNN ((-77.0282, -12.1354), 10);
+```
+
+- `WITHIN_RADIUS` usa la caja conservadora del radio y refina con haversine.
+- `KNN` usa una cola de prioridad por `MINDIST(Q, MBR)` y poda con la distancia
+  del k-ésimo vecino actual.
+- Sin índice el planificador cae a `SpatialSeqScan`.
+- En tablas `SEQUENTIAL` la inserción ordenada mueve slots, así que cada
+  `INSERT` reindexa el R-Tree para mantener los RID válidos. Crea el índice
+  después de la carga masiva, o usa `HEAP` si vas a insertar después.
+- El visor web muestra los puntos, el círculo/centro de consulta y los MBRs
+  inspeccionados (`visited_mbrs`) en la pestaña **Mapa espacial**.
+
+### Experimento 5
+
+```bash
+python -m backend.benchmarks.experiment5
+```
+
+Escribe `benchmarks/results/exp5_espacial.csv` (R-Tree vs escaneo secuencial para
+radio y k-NN con N = 10k, 50k, 100k) y `exp5_dimension.csv` (maldición de la
+dimensionalidad para D = 2…128). Las figuras y el informe están en
+`informe_analisis/experimento5_rtree.tex` (requiere `matplotlib` para
+`informe_analisis/figuras/generar.py`).
+
+### Contrato para el módulo textual
+
+`MATCH '<consulta>'` y `COSINE_SCORE()` ya se parsean (`TextMatch`, `ScoreExpr`
+en `parser.py`). El executor sigue respondiendo 501 hasta conectar el índice
+invertido. Para hacerlo: registrar el índice en `Catalog.indexes_of()` y
+reemplazar el `NotImplementedFeature` de `Executor._select`.
 
 ## Contrato con el resto del equipo
 

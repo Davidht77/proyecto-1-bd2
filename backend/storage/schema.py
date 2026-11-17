@@ -23,6 +23,34 @@ class ColumnType(IntEnum):
     FLOAT = 2
     CHAR = 3
     VECTOR = 4  # length = dimension D; cada componente es float32
+    POINT = 5   # (lon, lat) en float64; 16 bytes
+
+
+def parse_point(value) -> tuple[float, float]:
+    """Normaliza un punto geografico a ``(lon, lat)``.
+
+    Acepta una tupla/lista de dos numeros o el literal SQL ``POINT(x, y)``.
+    """
+    if isinstance(value, str):
+        texto = value.strip()
+        if texto.upper().startswith("POINT"):
+            texto = texto[texto.find("(") + 1 :]
+            if texto.endswith(")"):
+                texto = texto[:-1]
+        elif texto.startswith("(") and texto.endswith(")"):
+            texto = texto[1:-1]
+        partes = [p.strip() for p in texto.split(",")]
+        if len(partes) != 2 or not all(partes):
+            raise ValueError(f"un POINT se escribe como POINT(x, y), no {value!r}")
+        try:
+            return (float(partes[0]), float(partes[1]))
+        except ValueError as exc:
+            raise ValueError(f"componente no numerico en el punto: {exc}") from None
+    try:
+        x, y = value
+    except (TypeError, ValueError):
+        raise ValueError(f"un POINT necesita dos coordenadas, no {value!r}") from None
+    return (float(x), float(y))
 
 
 def parse_vector(value, dim: int | None = None) -> tuple[float, ...]:
@@ -69,6 +97,8 @@ class Column:
             return 8
         if self.type is ColumnType.VECTOR:
             return 4 * self.length
+        if self.type is ColumnType.POINT:
+            return 16
         return self.length
 
     @property
@@ -79,6 +109,8 @@ class Column:
             return "d"
         if self.type is ColumnType.VECTOR:
             return f"{self.length}f"
+        if self.type is ColumnType.POINT:
+            return "dd"
         return f"{self.length}s"
 
 
@@ -93,9 +125,11 @@ class Schema:
 
         self.columns: tuple[Column, ...] = tuple(columns)
         self.pk_index = pk_index
-        if self.pk_column.type is ColumnType.VECTOR:
-            raise ValueError("un VECTOR no puede ser clave primaria")
-        self._has_vector = any(c.type is ColumnType.VECTOR for c in self.columns)
+        if self.pk_column.type in (ColumnType.VECTOR, ColumnType.POINT):
+            raise ValueError("un VECTOR o un POINT no puede ser clave primaria")
+        self._has_composite = any(
+            c.type in (ColumnType.VECTOR, ColumnType.POINT) for c in self.columns
+        )
 
         # El prefijo "<" fija little-endian y desactiva el padding de alineacion,
         # de modo que record_size es exactamente la suma de los anchos.
@@ -128,6 +162,8 @@ class Schema:
             elif col.type is ColumnType.VECTOR:
                 # struct espera los D componentes como argumentos sueltos.
                 encoded.extend(parse_vector(value, col.length))
+            elif col.type is ColumnType.POINT:
+                encoded.extend(parse_point(value))
             elif col.type is ColumnType.INT:
                 encoded.append(int(value))
             else:
@@ -137,13 +173,17 @@ class Schema:
     def unpack(self, raw: bytes) -> tuple:
         values = self._struct.unpack(bytes(raw[: self.record_size]))
         out = []
-        if self._has_vector:
-            # struct devolvio los D componentes sueltos: se reagrupan por columna.
+        if self._has_composite:
+            # struct devolvio los componentes sueltos: se reagrupan por columna.
             i = 0
             for col in self.columns:
                 if col.type is ColumnType.VECTOR:
                     out.append(values[i : i + col.length])
                     i += col.length
+                    continue
+                if col.type is ColumnType.POINT:
+                    out.append(values[i : i + 2])
+                    i += 2
                     continue
                 value = values[i]
                 i += 1

@@ -520,6 +520,50 @@ table.grid tbody tr:hover { background: var(--seq-soft); }
 
 :focus-visible { outline: 2px solid var(--seq); outline-offset: 2px; }
 
+.mapview {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--u) * 2);
+  padding: calc(var(--u) * 3);
+  min-height: 420px;
+}
+
+.mapview-canvas {
+  width: 100%;
+  min-height: 420px;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: var(--surface);
+}
+
+.mapview-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: calc(var(--u) * 3);
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.mapview-legend .notice { margin: 0; }
+
+.mapview-legend .dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 4px;
+  border-radius: 50%;
+  vertical-align: middle;
+}
+
+.mapview-legend .dot.point { background: #2d9cdb; }
+.mapview-legend .dot.circle { border: 2px solid #d9822b; }
+.mapview-legend .dot.mbr {
+  border: 1px dashed #8a6d3b;
+  border-radius: 1px;
+  background: transparent;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }

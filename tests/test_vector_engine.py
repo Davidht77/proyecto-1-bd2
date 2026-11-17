@@ -235,8 +235,10 @@ def test_where_multicolumna_con_filtro_residual_y_order_by(db):
     assert [row[1] for row in r.rows] == [29.0, 29.0, 25.0]  # ids 29 y 529
 
 
-def test_match_y_within_radius_se_reportan_como_pendientes(db):
+def test_match_pendiente_y_within_radius_valida_columna_espacial(db):
     with pytest.raises(NotImplementedFeature, match="textual"):
         db.execute("SELECT id FROM prod WHERE cat MATCH 'zapatillas'")
-    with pytest.raises(NotImplementedFeature, match="espacial"):
+    # WITHIN_RADIUS ya está implementado: sobre una columna que no es POINT
+    # debe rechazarse con un error de ejecución, no con un 501.
+    with pytest.raises(SQLRuntimeError, match="POINT"):
         db.execute("SELECT id FROM prod WHERE cat WITHIN_RADIUS((1, 2), 3)")

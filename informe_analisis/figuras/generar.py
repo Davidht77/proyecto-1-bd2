@@ -99,3 +99,61 @@ for ax, campo, titulo in zip(axs, ("fanout", "height", "disk_reads"), ("Fan-out"
     for x, v in zip(bs, vals):
         ax.annotate(f"{v:,}".replace(",", " "), (x, v), textcoords="offset points", xytext=(0, 2), ha="center", fontsize=7)
 guardar(fig, "exp4_bloque")
+
+# --------------------------------------------------- Experimento 5 (R-Tree)
+f5 = leer("exp5_espacial.csv")
+n_max = max(int(r["n"]) for r in f5)
+ETQ5 = {"RTREE": "R-Tree", "SEQUENTIAL": "Secuencial"}
+
+radio = [r for r in f5 if r["query_type"] == "radius" and int(r["n"]) == n_max]
+fig, ax = plt.subplots(figsize=(5.5, 3.2))
+for i, (estructura, etiqueta) in enumerate(ETQ5.items()):
+    pts = sorted(
+        (float(r["selectivity"]) * 100, float(r["avg_reads"]))
+        for r in radio if r["structure"] == estructura
+    )
+    ax.plot(
+        [p[0] for p in pts], [p[1] for p in pts],
+        marker=MARCAS[i], color=COLORES[i], label=etiqueta,
+    )
+if any(float(r["selectivity"]) < 0.01 for r in radio):
+    ax.set_xscale("log")
+    ax.set_xticks([0.1, 1, 5, 10, 25], ["0,1", "1", "5", "10", "25"])
+ax.set_xlabel("Selectividad (% de tuplas)")
+ax.set_ylabel(f"Lecturas por consulta (N={n_max:,})".replace(",", " "))
+ax.legend(fontsize=8)
+guardar(fig, "exp5_radio")
+
+knn = [r for r in f5 if r["query_type"] == "knn" and int(r["n"]) == n_max]
+ks = sorted({int(r["k"]) for r in knn})
+fig, ax = plt.subplots(figsize=(5.5, 3.2))
+ancho = 0.35
+for i, (estructura, etiqueta) in enumerate(ETQ5.items()):
+    vals = [
+        float(next(r["avg_reads"] for r in knn if r["structure"] == estructura and int(r["k"]) == k))
+        for k in ks
+    ]
+    ax.bar([x + (i - 0.5) * ancho for x in range(len(ks))], vals,
+           width=ancho, color=COLORES[i], label=etiqueta)
+ax.set_xticks(range(len(ks)), [str(k) for k in ks])
+ax.set_xlabel("k (vecinos más cercanos)")
+ax.set_ylabel(f"Lecturas por consulta (N={n_max:,})".replace(",", " "))
+ax.set_ylim(0, max(1.0, max(float(r["avg_reads"]) for r in knn) * 1.15))
+ax.legend(fontsize=8, loc="upper center", ncol=2)
+guardar(fig, "exp5_knn")
+
+f5d = leer("exp5_dimension.csv")
+fig, ax = plt.subplots(figsize=(5.5, 3.2))
+for i, (estructura, etiqueta) in enumerate(ETQ5.items()):
+    pts = sorted(
+        (int(r["dim"]), float(r["avg_reads"]))
+        for r in f5d if r["structure"] == estructura
+    )
+    ax.plot([p[0] for p in pts], [p[1] for p in pts],
+            marker=MARCAS[i], color=COLORES[i], label=etiqueta)
+ax.set_xscale("log", base=2)
+ax.set_yscale("log")
+ax.set_xlabel("Dimensión D")
+ax.set_ylabel("Lecturas por consulta")
+ax.legend(fontsize=8)
+guardar(fig, "exp5_dimension")

@@ -51,12 +51,14 @@ from backend.engine.parser import (
     ScoreExpr,
     Select,
     SetOption,
+    SpatialKNN,
     SpatialRadius,
     Statement,
-    TextMatch,
     parse,
 )
+from backend.index import geo
 from backend.index.hash import RID as HashRID
+from backend.index.rtree import RTreeRID
 from backend.storage.page import page_capacity
 from backend.storage.schema import ColumnType, Schema, parse_vector
 from backend.vector.ivf import IVFIndex, VRID
@@ -93,6 +95,13 @@ class QueryResult:
     exec_ms: float
     message: str | None = None
     truncated: bool = False
+    spatial: dict | None = None
+
+    @property
+    def index_reads(self) -> int:
+        """Bloques leidos en indices durante la ejecucion (telemetria del plan)."""
+        io = self.plan.detail.get("io") or {}
+        return int(io.get("index_reads", 0))
 
     def as_dict(self) -> dict:
         return {
@@ -107,6 +116,7 @@ class QueryResult:
                 "exec_ms": round(self.exec_ms, 3),
                 "total_ms": round(self.parse_ms + self.exec_ms, 3),
             },
+            "spatial": self.spatial,
             "message": self.message,
             "truncated": self.truncated,
         }
@@ -191,9 +201,8 @@ class Executor:
     def _create_index(self, stmt: CreateIndex) -> QueryResult:
         if not self.catalog.exists(stmt.table):
             raise TableNotFound(f"la tabla «{stmt.table}» no existe")
-        if stmt.kind not in ("HASH", "BTREE", "IVF"):
-            dueno = {"RTREE": "el módulo espacial (R-Tree)",
-                     "INVERTED": "el módulo textual (índice invertido)",
+        if stmt.kind not in ("HASH", "BTREE", "IVF", "RTREE"):
+            dueno = {"INVERTED": "el módulo textual (índice invertido)",
                      "HNSW": "una segunda estructura ANN (se implementó IVF)"}.get(stmt.kind, "")
             raise NotImplementedFeature(
                 f"CREATE INDEX ... USING {stmt.kind} todavía no está conectado al motor"
@@ -210,6 +219,15 @@ class Executor:
                 f"{stmt.table}.{stmt.column}: {st['n_vectors']} vectores de dimensión "
                 f"{st['dim']} en {st['n_lists']} celdas de Voronoi, {st['list_pages']} "
                 f"páginas de listas ({st['records_per_page']} vectores por página)."
+            )
+        elif stmt.kind == "RTREE":
+            tree = self.catalog.open_index(stmt.table, stmt.name)
+            st = tree.inspect()
+            mensaje = (
+                f"Índice «{stmt.name}» creado (RTREE) sobre {stmt.table}.{stmt.column}. "
+                f"Dimensión {st['dim']}, altura {st['height']}, fan-out {st['fanout']}, "
+                f"{st['entries']} entradas en {st['node_count']} nodos "
+                f"({st['leaf_count']} hojas, {st['fill_pct']}% de ocupación media)."
             )
         elif stmt.kind == "HASH":
             mensaje = f"Índice «{stmt.name}» creado sobre {stmt.table}({stmt.column}) usando HASH."
@@ -261,13 +279,22 @@ class Executor:
                     raise SQLRuntimeError(f"columna «{col.name}»: {exc}") from None
         es_seq = self.catalog.engine_of(stmt.table) == "SEQUENTIAL"
         sf.counter.reset()
-        paginas_antes = sf.page_count
+        overflow_antes = sf.n_overflow if es_seq else 0
         rid = sf.insert(tuple(valores))
         self._index_on_insert(stmt.table, sf.schema, valores, rid)
         sf.flush()
+        # La reorganizacion automatica vacia el overflow; es la senal fiable de
+        # que se reescribio el area principal.
+        reorganizo = es_seq and overflow_antes > 0 and sf.n_overflow == 0
+        if es_seq and self._rtree_indexes_of(stmt.table):
+            # En un Sequential File la insercion ordenada desplaza slots y los
+            # splits de overflow mueven registros: ambos invalidan RIDs aunque
+            # no haya reorganizacion. Reindexar es la unica forma segura de
+            # mantener el R-Tree; por eso conviene crearlo tras la carga masiva.
+            self._rebuild_rtree_indexes(stmt.table)
 
         mensaje = "1 registro insertado."
-        if es_seq and sf.page_count != paginas_antes:
+        if reorganizo:
             mensaje += (
                 f" Se disparó una reorganización automática: el área de overflow "
                 f"superó su límite de {sf.overflow_cap} registros."
@@ -287,33 +314,53 @@ class Executor:
         )
 
     def _delete(self, stmt: Delete) -> QueryResult:
-        # NOTA: esto no mantiene los indices BTREE de la tabla. HeapFile
-        # borra con move-the-last (el ultimo registro del archivo hereda el
-        # RID del borrado) y SequentialFile puede desplazar overflow, asi
-        # que un borrado invalida RIDs de formas que un simple "quita esta
-        # clave del arbol" no repara. Falta una pasada de reindexado
-        # (o reconstruir los indices con Catalog.create_index) tras un
-        # DELETE si la tabla tiene indices BTREE activos.
+        # NOTA: los indices BTREE no se mantienen. HeapFile borra con
+        # move-the-last y SequentialFile puede desplazar overflow, asi que un
+        # borrado invalida RIDs. El R-Tree se reconstruye al final del DELETE
+        # para que sus RID fisicos vuelvan a ser validos.
         sf = self.catalog.open_table(stmt.table)
-        if stmt.where is None:
+        if stmt.where is None and not stmt.special:
             raise SQLRuntimeError(
                 "Un DELETE sin WHERE borraría la tabla entera. Usa DROP TABLE si es lo que quieres."
             )
-        filtros = stmt.filters or [stmt.where]
+        filtros = stmt.filters or ([stmt.where] if stmt.where is not None else [])
         for f in filtros:
             _validar_columna(sf.schema, f.column, stmt.table)
-        acceso, plan = self._choose_access(sf, stmt.table, filtros, "Delete")
-        residuales = [f for f in filtros if f is not acceso]
 
         sf.counter.reset()
-        if plan.access == "BinarySearch" and not residuales:
-            claves = [acceso.lo] if sf.search(acceso.lo) is not None else []
-        else:
+        if stmt.special:
+            pred = stmt.special[0]
+            if not isinstance(pred, SpatialRadius):
+                raise SQLRuntimeError(
+                    "DELETE solo admite WITHIN_RADIUS; KNN no define un conjunto estable de bajas."
+                )
+            _validar_columna(sf.schema, pred.column, stmt.table)
+            info = self._rtree_for(stmt.table, pred.column)
             claves = [
                 sf.schema.key_of(row)
-                for row in self._rows_for(sf, acceso, plan, limit=None, table=stmt.table)
-                if all(_matches(sf.schema, row, f) for f in residuales)
+                for row in self._spatial_rows(sf, stmt.table, pred, filtros)
             ]
+            plan = Plan(
+                "RTreeRangeScan" if info else "SpatialSeqScan",
+                stmt.table,
+                (
+                    f"Bajas por radio geográfico con el R-Tree «{info['name']}»."
+                    if info else
+                    "Bajas por radio geográfico: sin índice espacial se recorre la tabla completa."
+                ),
+                detail={"point_column": pred.column},
+            )
+        else:
+            acceso, plan = self._choose_access(sf, stmt.table, filtros, "Delete")
+            residuales = [f for f in filtros if f is not acceso]
+            if plan.access == "BinarySearch" and not residuales:
+                claves = [acceso.lo] if sf.search(acceso.lo) is not None else []
+            else:
+                claves = [
+                    sf.schema.key_of(row)
+                    for row in self._rows_for(sf, acceso, plan, limit=None, table=stmt.table)
+                    if all(_matches(sf.schema, row, f) for f in residuales)
+                ]
 
         indices_hash = self._hash_indexes_of(stmt.table)
         indices_ivf = self._ivf_indexes_of(stmt.table)
@@ -338,6 +385,7 @@ class Executor:
                 for idx, _ in indices_ivf:
                     idx.flush()
         sf.flush()
+        self._rebuild_rtree_indexes(stmt.table)
 
         return _ok(
             plan,
@@ -390,6 +438,44 @@ class Executor:
         for idx, col_idx in self._ivf_indexes_of(table):
             idx.insert(values[schema.pk_index], rid, values[col_idx])
             idx.flush()
+        for info, col_idx in self._rtree_indexes_of(table):
+            idx = self.catalog.open_index(table, info["name"])
+            idx.insert(tuple(values[col_idx]), RTreeRID.from_engine_rid(rid))
+            idx.flush()
+
+    def _rtree_indexes_of(self, table: str) -> list[tuple[dict, int]]:
+        sf = self.catalog.open_table(table)
+        out = []
+        for info in self.catalog.indexes_of(table):
+            if info["kind"] != "RTREE":
+                continue
+            col_idx = next(
+                i for i, c in enumerate(sf.schema.columns)
+                if c.name.lower() == info["column"].lower()
+            )
+            out.append((info, col_idx))
+        return out
+
+    def _rtree_for(self, table: str, column: str) -> dict | None:
+        return next(
+            (
+                info for info in self.catalog.indexes_of(table)
+                if info["kind"] == "RTREE" and info["column"].lower() == column.lower()
+            ),
+            None,
+        )
+
+    def _rebuild_rtree_indexes(self, table: str) -> None:
+        """Reconstruye los R-Tree tras un DELETE o una reorganizacion.
+
+        Son indices con RID fisicos: move-the-last y la reescritura del
+        Sequential File mueven filas, asi que la unica forma barata de dejar
+        las entradas apuntando a la posicion correcta es reindexar la tabla.
+        """
+        infos = [i for i in self.catalog.indexes_of(table) if i["kind"] == "RTREE"]
+        for info in infos:
+            self.catalog.drop_index(table, info["name"])
+            self.catalog.create_index(table, info["name"], info["column"], "RTREE")
 
     # ------------------------------------------------------------- SELECT
 
@@ -399,12 +485,12 @@ class Executor:
 
         if stmt.special:
             pred = stmt.special[0]
-            modulo = ("el módulo textual (índice invertido + COSINE_SCORE)"
-                      if isinstance(pred, TextMatch) else "el módulo espacial (R-Tree)")
+            if isinstance(pred, (SpatialRadius, SpatialKNN)):
+                return self._select_spatial(stmt, sf, pred, max_rows)
+            modulo = "el módulo textual (índice invertido + COSINE_SCORE)"
             raise NotImplementedFeature(
-                f"El predicado {'MATCH' if isinstance(pred, TextMatch) else 'WITHIN_RADIUS'} "
-                f"ya se parsea, pero su ejecución corresponde a {modulo}, que aún no está "
-                f"conectado al planificador."
+                f"El predicado MATCH ya se parsea, pero su ejecución corresponde a "
+                f"{modulo}, que aún no está conectado al planificador."
             )
         if any(isinstance(c, ScoreExpr) for c in stmt.columns):
             raise SQLRuntimeError("COSINE_SCORE()/BM25_SCORE() solo tienen sentido junto a un predicado MATCH")
@@ -439,7 +525,7 @@ class Executor:
                 break
             total += 1
             if len(filas) < max_rows:
-                filas.append([row[i] for i in proyeccion])
+                filas.append([_jsonable(row[i]) for i in proyeccion])
         reads, writes = self._io_finish(io, plan)
 
         return QueryResult(
@@ -453,6 +539,201 @@ class Executor:
             exec_ms=0.0,
             truncated=total > len(filas),
         )
+
+    def _select_spatial(self, stmt: Select, sf, pred, max_rows: int) -> QueryResult:
+        """Plan y ejecución de WITHIN_RADIUS y KNN (enunciado 5.1).
+
+        Con índice usa el R-Tree (poda de MBRs y best-first KNN); sin índice
+        cae a un escaneo secuencial con filtro haversine exacto.
+        """
+        schema = sf.schema
+        _validar_columna(schema, pred.column, stmt.table)
+        for f in stmt.filters:
+            _validar_columna(schema, f.column, stmt.table)
+        col_idx = next(
+            i for i, c in enumerate(schema.columns)
+            if c.name.lower() == pred.column.lower()
+        )
+        col = schema.columns[col_idx]
+        if col.type is not ColumnType.POINT:
+            raise SQLRuntimeError(
+                f"«{col.name}» es {col.type.name}: los predicados espaciales solo "
+                "aplican a columnas POINT."
+            )
+
+        info = self._rtree_for(stmt.table, pred.column)
+        io = self._io_snapshot(sf, stmt.table)
+        tree = None
+        visited: list[list[float]] = []
+
+        if isinstance(pred, SpatialRadius):
+            accion = "WITHIN_RADIUS"
+            if info:
+                tree = self.catalog.open_index(stmt.table, info["name"])
+                window = geo.radius_bbox(pred.center[0], pred.center[1], pred.radius)
+                rids = tree.search_window(window, collect_mbrs=True)
+                candidatas = [
+                    row for row in (self._row_from_rtree(stmt.table, rid) for rid in rids)
+                    if row is not None
+                ]
+                visited = [list(mbr) for mbr in tree.last_visited_mbrs]
+                access = "RTreeRangeScan"
+                razon = (
+                    f"WITHIN_RADIUS con el R-Tree «{info['name']}»: se podan las ramas "
+                    f"cuyo MBR no intersecta la ventana de {pred.radius:g} km y se "
+                    f"refina cada candidato con distancia haversine exacta."
+                )
+                estimated = None
+            else:
+                candidatas = list(sf.scan())
+                access = "SpatialSeqScan"
+                razon = (
+                    "WITHIN_RADIUS sin índice espacial: se recorre la tabla completa "
+                    "y se calcula la distancia haversine de cada fila."
+                )
+                estimated = max(1, sf.page_count)
+
+            filas_filtradas = [
+                row for row in candidatas
+                if geo.point_in_radius(
+                    row[col_idx][0], row[col_idx][1],
+                    pred.center[0], pred.center[1], pred.radius,
+                )
+                and all(_matches(schema, row, f) for f in stmt.filters)
+            ]
+        else:  # SpatialKNN
+            accion = "KNN"
+            k = pred.k
+            if info:
+                tree = self.catalog.open_index(stmt.table, info["name"])
+                rids = tree.knn(pred.center, k, collect_mbrs=True)
+                candidatas = [
+                    row for row in (self._row_from_rtree(stmt.table, rid) for rid in rids)
+                    if row is not None
+                ]
+                visited = [list(mbr) for mbr in tree.last_visited_mbrs]
+                filas_filtradas = [
+                    row for row in candidatas
+                    if all(_matches(schema, row, f) for f in stmt.filters)
+                ]
+                access = "RTreeKNN"
+                razon = (
+                    f"KNN con el R-Tree «{info['name']}»: cola de prioridad por "
+                    f"MINDIST(centro, MBR) y poda cuando la cota inferior supera la "
+                    f"distancia del {k}-ésimo vecino actual."
+                )
+                estimated = None
+            else:
+                candidatas = list(sf.scan())
+                filas_filtradas = [
+                    row for row in candidatas
+                    if all(_matches(schema, row, f) for f in stmt.filters)
+                ]
+                filas_filtradas.sort(
+                    key=lambda row: geo.haversine(
+                        pred.center[0], pred.center[1], row[col_idx][0], row[col_idx][1]
+                    )
+                )
+                filas_filtradas = filas_filtradas[:k]
+                access = "SpatialSeqScan"
+                razon = (
+                    "KNN sin índice espacial: escaneo completo, distancia haversine "
+                    f"de cada fila y selección de los {k} mejores."
+                )
+                estimated = max(1, sf.page_count)
+
+        orden = self._order_column(schema, stmt)
+        if orden is not None:
+            idx, desc = orden
+            filas_filtradas = sorted(
+                filas_filtradas, key=lambda r: r[idx], reverse=desc
+            )
+
+        if stmt.limit is not None:
+            filas_filtradas = filas_filtradas[: stmt.limit]
+
+        proyeccion, columnas = _projection(schema, stmt.columns, stmt.table)
+        total = len(filas_filtradas)
+        filas = [
+            [_jsonable(row[i]) for i in proyeccion]
+            for row in filas_filtradas[:max_rows]
+        ]
+
+        detalle = {
+            "point_column": col.name,
+            "kind": accion,
+            "index_name": info["name"] if info else None,
+            "dim": getattr(tree, "dim", 2),
+        }
+        if orden is not None:
+            detalle["sort"] = f"{schema.columns[orden[0]].name} en memoria"
+        if isinstance(pred, SpatialRadius):
+            detalle["radius_km"] = pred.radius
+        else:
+            detalle["k"] = pred.k
+        plan = Plan(
+            access, stmt.table, razon,
+            estimated_reads=estimated,
+            detail=detalle,
+        )
+        reads, writes = self._io_finish(io, plan)
+        spatial = {
+            "point_column": col.name,
+            "query": {
+                "kind": pred.kind,
+                "center": [float(pred.center[0]), float(pred.center[1])],
+                "radius_km": pred.radius_km,
+                "k": pred.k if isinstance(pred, SpatialKNN) else None,
+            },
+            "index_name": info["name"] if info else None,
+            "visited_mbrs": visited,
+        }
+        return QueryResult(
+            columns=columnas,
+            rows=filas,
+            row_count=total,
+            plan=plan,
+            disk_reads=reads,
+            disk_writes=writes,
+            parse_ms=0.0,
+            exec_ms=0.0,
+            truncated=total > len(filas),
+            spatial=spatial,
+        )
+
+    def _row_from_rtree(self, table: str, rid: RTreeRID) -> tuple | None:
+        try:
+            return self.catalog.row_at(
+                table, HashRID(rid.page_id, rid.slot, rid.area)
+            )
+        except (IndexError, ValueError):
+            return None
+
+    def _spatial_rows(self, sf, table: str, pred, filters: list[Condition]) -> list[tuple]:
+        """Filas que cumplen un WITHIN_RADIUS, para DELETE."""
+        col_idx = next(
+            i for i, c in enumerate(sf.schema.columns)
+            if c.name.lower() == pred.column.lower()
+        )
+        info = self._rtree_for(table, pred.column)
+        if info:
+            tree = self.catalog.open_index(table, info["name"])
+            window = geo.radius_bbox(pred.center[0], pred.center[1], pred.radius)
+            rids = tree.search_window(window, collect_mbrs=False)
+            candidatas = [
+                row for row in (self._row_from_rtree(table, rid) for rid in rids)
+                if row is not None
+            ]
+        else:
+            candidatas = list(sf.scan())
+        return [
+            row for row in candidatas
+            if geo.point_in_radius(
+                row[col_idx][0], row[col_idx][1],
+                pred.center[0], pred.center[1], pred.radius,
+            )
+            and all(_matches(sf.schema, row, f) for f in filters)
+        ]
 
     def _order_column(self, schema: Schema, stmt: Select) -> tuple[int, bool] | None:
         if stmt.order_by is None:
