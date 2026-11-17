@@ -479,8 +479,8 @@ class Catalog:
         for path in self.data_dir.glob(f"{prefix}*.btree.dat"):
             index_name = path.name[len(prefix) : -len(".btree.dat")]
             if "." in index_name:
-                # Archivos internos de otro indice (el vocabulario B+ del
-                # invertido: <tabla>__<idx>.inv.spimi.vocab.btree.dat).
+                # Archivos internos de otro indice (B+ auxiliares con punto en
+                # el nombre); el diccionario del invertido ya es .vocab.dic.
                 continue
             header = peek_header(str(path))
             out.append({

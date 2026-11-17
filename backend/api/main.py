@@ -516,7 +516,7 @@ async def multimedia_search(
     return {"query": origen, **r}
 
 
-# ------------------------------------------------- endpoints declarados, pendientes
+# ------------------------------------------------- benchmarks e inspeccion de indices
 
 
 @app.post("/api/benchmarks/run")

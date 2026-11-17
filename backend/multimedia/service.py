@@ -5,11 +5,11 @@ Todo lo persistente vive en el motor del proyecto:
     imagenes       (id INT PK, categoria CHAR(20), archivo CHAR(64), emb VECTOR(512)) USING HEAP
     idx_emb        IVF COSINE sobre imagenes.emb                       (paradigma moderno)
     codebook_bovw  (id INT PK, centro VECTOR(128)) USING HEAP          (palabras visuales)
-    <text_dir>/imagenes__bovw.*   vocabulario B+ + postings + normas   (paradigma clasico)
+    <text_dir>/imagenes__bovw.*   vocab.dic + postings.inv + normas   (paradigma clasico)
 
-El indice BoVW se guarda en un subdirectorio (`data/text/`) porque el catalogo
-descubre los indices relacionales por el nombre de archivo en `data/` y un
-`.btree.dat` de vocabulario no debe aparecer como un B+ de la tabla.
+El indice BoVW se guarda en un subdirectorio (`data/text/`) para separar los
+archivos del modulo textual (`vocab.dic`, `postings.inv`, `norms.dat`) de las
+tablas e indices relacionales que el catalogo descubre por nombre en `data/`.
 
 Extraccion de caracteristicas (`extract_features`): una pasada de SIFT sobre
 una muestra para entrenar el/los codebooks y una segunda pasada completa que

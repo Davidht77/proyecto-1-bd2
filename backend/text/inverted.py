@@ -12,8 +12,9 @@ Archivos (todos paginados por el Pager, descubiertos por nombre):
                                     va como nombre de la unica columna del esquema,
                                     user_a = scoring por defecto, user_b = 1 si el
                                     indice quedo desactualizado tras un INSERT/DELETE
-    <base>.inv.spimi.vocab.btree.dat  vocabulario: B+ termino -> (inicio, df)
-    <base>.inv.spimi.post             postings <page, slot, tf, dl> ordenados por RID
+    <base>.inv.vocab.dic            diccionario: B+ termino -> (offset, df); el
+                                    largo de la lista de posteo es df
+    <base>.inv.postings.inv         postings <page, slot, tf, dl> ordenados por RID
     <base>.inv.norms.dat              ||d|| de cada documento (TF-IDF)
 
 El vocabulario, los postings y las normas son los del modulo textual (SPIMI) y
@@ -47,6 +48,7 @@ from backend.storage.pager import Pager
 from backend.storage.schema import Column, ColumnType, Schema
 from backend.text import boolean
 from backend.text.preprocess import preprocess, preprocess_query
+from backend.text.spimi import POSTINGS_SUFFIX, VOCAB_SUFFIX
 
 SCORINGS = ("TFIDF_COSINE", "BM25")
 SCORE_FUNCTION = {"COSINE_SCORE": "TFIDF_COSINE", "BM25_SCORE": "BM25"}
@@ -55,7 +57,7 @@ BM25_K1, BM25_B = 1.2, 0.75
 
 _META = ".inv.meta"
 _TEXT = ".inv"
-_TEXT_FILES = (".spimi.vocab.btree.dat", ".spimi.post", ".norms.dat")
+_TEXT_FILES = (VOCAB_SUFFIX, POSTINGS_SUFFIX, ".norms.dat")
 
 
 def files_of(base: str) -> list[Path]:
@@ -149,7 +151,7 @@ class InvertedIndex:
         return self._text
 
     def stats(self) -> dict:
-        if self.stale and not Path(self.base + _TEXT + ".spimi.post").exists():
+        if self.stale and not Path(self.base + _TEXT + POSTINGS_SUFFIX).exists():
             return {"scoring": self.scoring, "stale": True}
         st = self._index().stats()
         size = sum(p.stat().st_size for p in files_of(self.base) if p.exists())

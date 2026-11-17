@@ -82,6 +82,12 @@ def test_inverted_valida_columna_y_opciones(db):
         db.execute("CREATE INDEX i ON docs (texto) USING INVERTED WITH (lists = 3)")
 
 
+def test_invertido_persiste_vocab_dic_y_postings_inv(db_idx, tmp_path):
+    """Enunciado 5.2: diccionario y listas de posteo en dos archivos binarios."""
+    nombres = {p.name for p in (tmp_path / "data").glob("docs__itx*")}
+    assert {"docs__itx.inv.vocab.dic", "docs__itx.inv.postings.inv", "docs__itx.inv.norms.dat"} <= nombres
+
+
 def test_drop_table_borra_los_archivos_del_invertido(db_idx, tmp_path):
     db_idx.execute("DROP TABLE docs")
     assert not list((tmp_path / "data").glob("docs__itx*"))

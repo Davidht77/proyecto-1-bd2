@@ -9,8 +9,9 @@ clase04.txt
 enunciado.txt
 docs/superpowers/
 
-# datos binarios generados por el motor
-data/
+# datos binarios generados por el motor (la carpeta se versiona solo con su README)
+data/*
+!data/README.md
 
 # artefactos de desarrollo
 .playwright-mcp/
