@@ -44,11 +44,12 @@ WITH (metric = 'COSINE')}. La consulta es SQL ordinario del módulo vectorial:
 
 \begin{lstlisting}
 SELECT id, categoria, archivo, emb <=> '[...]' AS dist
-FROM imagenes ORDER BY dist ASC LIMIT 10;      -- IVFScan (o KnnSeqScan con <->)
+FROM imagenes ORDER BY dist ASC LIMIT 10;      -- IVFScan (o KnnSeqScan con SET vector.scan = 'EXACT')
 \end{lstlisting}
 
 \begin{figure}[H]
 \centering
+\resizebox{\textwidth}{!}{%
 \begin{tikzpicture}[
   node distance=3mm and 5mm,
   caja/.style={draw, rounded corners=1pt, align=center, font=\footnotesize, inner sep=3pt, minimum height=7mm},
@@ -58,7 +59,7 @@ FROM imagenes ORDER BY dist ASC LIMIT 10;      -- IVFScan (o KnnSeqScan con <->)
 \node[caja, above right=2mm and 8mm of img, fill=blue!6] (sift) {SIFT\\ $n\times128$};
 \node[caja, right=of sift, fill=blue!6] (cb) {codebook\\ K-Means ($K$)\\ tabla \code{codebook\_bovw}};
 \node[caja, right=of cb, fill=blue!6] (bag) {bolsa de palabras\\ \code{vw0012 vw0377 \ldots}};
-\node[caja, right=of bag, fill=green!6] (inv) {índice invertido\\ vocab B+ + postings\\ + \code{norms.dat}};
+\node[caja, right=of bag, fill=green!6] (inv) {índice invertido\\ \code{vocab.dic} + \code{postings.inv}\\ + \code{norms.dat}};
 \node[caja, below right=2mm and 8mm of img, fill=orange!8] (cnn) {ResNet-18\\ avgpool 512-D};
 \node[caja, right=of cnn, fill=orange!8] (tab) {\code{imagenes.emb}\\ \code{VECTOR(512)}};
 \node[caja, right=of tab, fill=green!6] (ivf) {IVF COSINE\\ \code{.ivf.dir} + \code{.ivf.lst}};
@@ -66,23 +67,24 @@ FROM imagenes ORDER BY dist ASC LIMIT 10;      -- IVFScan (o KnnSeqScan con <->)
 \node[caja, right=of inv] (q1) {TF-IDF coseno\\ top-$k$ (heap)};
 \draw[flecha] (img) -- (sift); \draw[flecha] (sift) -- (cb); \draw[flecha] (cb) -- (bag); \draw[flecha] (bag) -- (inv); \draw[flecha] (inv) -- (q1);
 \draw[flecha] (img) -- (cnn); \draw[flecha] (cnn) -- (tab); \draw[flecha] (tab) -- (ivf); \draw[flecha] (ivf) -- (q2);
-\end{tikzpicture}
+\end{tikzpicture}%
+}
 \caption{Los dos caminos de una imagen. Arriba el clásico (SIFT $\to$ palabras visuales $\to$ índice invertido), abajo el moderno (CNN $\to$ \code{VECTOR} $\to$ IVF). Los dos terminan en archivos paginados del motor.}
 \end{figure}
 
 \subsection{Texto: SBERT sobre el mismo motor}
 
 Para el corpus del RAG el embedding es SBERT multilingüe
-(\code{paraphrase-multilingual-MiniLM-L12-v2}, 384 dimensiones), calculado sobre
+(\code{paraphrase-multilingual-}\allowbreak\code{MiniLM-L12-v2}, 384 dimensiones), calculado sobre
 ``título. texto'' para que el título pese en la representación. La tabla
-\code{documentos(id, lang CHAR(2), titulo CHAR(80), texto CHAR(1000), emb VECTOR(384))}
+\code{documentos(id, lang CHAR(2), titulo CHAR(80),} \code{texto CHAR(1000), emb VECTOR(384))}
 ocupa un registro por página de 4 KB (2\,622 bytes), lo que hace muy visible la
 diferencia entre leer la tabla y leer un índice. Sobre ella conviven el IVF
 (\code{idx\_emb}, métrica coseno) y el índice invertido SPIMI construido con el
 pipeline léxico del Rol 2, sobre cuyos postings corren tanto BM25 como el TF-IDF
-coseno de esta sección. Todos los índices textuales viven en \code{data/text/} porque
-el catálogo descubre los índices relacionales por el nombre del archivo y el
-vocabulario, que es un B+ de términos, no debe aparecer como un índice de la tabla.
+coseno de esta sección. Los índices textuales de la aplicación (\code{vocab.dic},
+\code{postings.inv} y \code{norms.dat}) viven en \code{data/text/}, separados de las
+tablas e índices relacionales que el catálogo descubre por nombre en \code{data/}.
 
 \subsection{Aplicación de IA: RAG sobre Wikipedia}
 

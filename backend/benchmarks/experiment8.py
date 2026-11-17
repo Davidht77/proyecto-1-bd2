@@ -13,6 +13,12 @@ Uso:
     python -m backend.benchmarks.experiment8                 # sintetico, N=20k, D=128
     python -m backend.benchmarks.experiment8 --n 50000
     python -m backend.benchmarks.experiment8 --npy emb.npy   # embeddings reales (N, D)
+    python -m backend.benchmarks.experiment8 --csv data/datasets/wiki_20k.csv --metric COSINE
+        # embeddings SBERT del corpus del RAG (se calculan una vez y quedan en <csv>.sbert.npy)
+
+Con embeddings reales las consultas son documentos reales que se dejan fuera
+de la tabla (las ultimas `--queries` filas): una pregunta nueva, no un punto
+de la tabla con ruido.
 """
 
 from __future__ import annotations
@@ -97,12 +103,35 @@ def _resumen(ms, reads, idx, tab):
             statistics.mean(idx), statistics.mean(tab))
 
 
+def embeddings_de_csv(csv_path: str) -> str:
+    """Embeddings SBERT ("titulo. texto", como el corpus del RAG), cacheados en .npy."""
+    import csv as _csv
+    from pathlib import Path
+
+    destino = Path(csv_path).with_suffix(".sbert.npy")
+    if not destino.exists():
+        from backend.multimedia.dense import TextEmbedder
+
+        with open(csv_path, encoding="utf-8", newline="") as f:
+            filas = list(_csv.DictReader(f))
+        print(f"  calculando {len(filas)} embeddings SBERT (una sola vez)...", flush=True)
+        E = TextEmbedder().embed([f"{r['title']}. {r['text']}" for r in filas])
+        np.save(destino, E)
+    return str(destino)
+
+
 def run(n: int = 20_000, dim: int = 128, n_queries: int = 100, npy: str | None = None,
-        seed: int = 0) -> tuple[list[AnnRow], list[HybridRow]]:
-    X = np.load(npy).astype(np.float32) if npy else sintetico(n, dim, seed)
+        seed: int = 0, metric: str = "L2") -> tuple[list[AnnRow], list[HybridRow]]:
+    op = "<->" if metric == "L2" else "<=>"
+    if npy:
+        datos = np.load(npy).astype(np.float32)
+        # Consultas = documentos reales que no estan en la tabla.
+        X, Q = datos[:-n_queries], datos[-n_queries:]
+    else:
+        X = sintetico(n, dim, seed)
+        rng = np.random.default_rng(seed + 1)
+        Q = X[rng.integers(n, size=n_queries)] + rng.normal(size=(n_queries, X.shape[1])).astype(np.float32) * 0.3
     n, dim = X.shape
-    rng = np.random.default_rng(seed + 1)
-    Q = X[rng.integers(n, size=n_queries)] + rng.normal(size=(n_queries, dim)).astype(np.float32) * 0.3
 
     tmp = tempfile.mkdtemp(prefix="exp8_")
     cat = Catalog(tmp, page_size=4096, cache_size=0)
@@ -114,21 +143,21 @@ def run(n: int = 20_000, dim: int = 128, n_queries: int = 100, npy: str | None =
         # ---- verdad de campo: k-NN exacto
         verdad, ms, rd, ir, tr = [], [], [], [], []
         for q in Q:
-            ids, m = _medir(ex, f"SELECT id FROM items ORDER BY emb <-> '{_vec(q)}' LIMIT {K}")
+            ids, m = _medir(ex, f"SELECT id FROM items ORDER BY emb {op} '{_vec(q)}' LIMIT {K}")
             assert m["access"] == "KnnSeqScan"
             verdad.append(set(ids))
             ms.append(m["ms"]); rd.append(m["reads"]); ir.append(m["index"]); tr.append(m["table"])
         ann: list[AnnRow] = [AnnRow("exact", 0, n, dim, 0, 1.0, *_resumen(ms, rd, ir, tr))]
         print(f"  exacto: {ann[0].avg_ms:.1f} ms, {ann[0].avg_reads:.0f} lecturas", flush=True)
 
-        ex.execute("CREATE INDEX iv ON items (emb) USING IVF WITH (metric = 'L2')")
+        ex.execute(f"CREATE INDEX iv ON items (emb) USING IVF WITH (metric = '{metric}')")
         n_lists = cat.open_index("items", "iv").n_lists
 
         for p in [p for p in PROBES if p <= n_lists]:
             ex.execute(f"SET ivf.probes = {p}")
             rec, ms, rd, ir, tr = [], [], [], [], []
             for q, gt in zip(Q, verdad):
-                ids, m = _medir(ex, f"SELECT id FROM items ORDER BY emb <-> '{_vec(q)}' LIMIT {K}")
+                ids, m = _medir(ex, f"SELECT id FROM items ORDER BY emb {op} '{_vec(q)}' LIMIT {K}")
                 rec.append(len(gt & set(ids)) / K)
                 ms.append(m["ms"]); rd.append(m["reads"]); ir.append(m["index"]); tr.append(m["table"])
             fila = AnnRow("ivf", p, n, dim, n_lists, statistics.mean(rec), *_resumen(ms, rd, ir, tr))
@@ -148,15 +177,16 @@ def run(n: int = 20_000, dim: int = 128, n_queries: int = 100, npy: str | None =
             precios = np.random.default_rng(1).permutation(n)
             mask[precios < tope] = True
             verdad_f = []
+            from backend.vector.distance import distances
             for q in Qh:
-                d = np.where(mask, np.linalg.norm(X - q, axis=1), np.inf)
+                d = np.where(mask, distances(q, X, metric), np.inf)
                 verdad_f.append({int(i) for i in np.argsort(d)[:K] if np.isfinite(d[i])})
             for estrategia in ("PRE", "POST"):
                 ex.execute(f"SET hybrid.strategy = '{estrategia}'")
                 rec, ms, rd, ir, tr, exp = [], [], [], [], [], []
                 for q, gt in zip(Qh, verdad_f):
                     ids, m = _medir(ex, f"SELECT id FROM items WHERE {where} "
-                                        f"ORDER BY emb <-> '{_vec(q)}' LIMIT {K}")
+                                        f"ORDER BY emb {op} '{_vec(q)}' LIMIT {K}")
                     rec.append(len(gt & set(ids)) / max(1, len(gt)))
                     ms.append(m["ms"]); rd.append(m["reads"]); ir.append(m["index"])
                     tr.append(m["table"]); exp.append(m["expansions"])
@@ -181,10 +211,16 @@ def main() -> None:
     ap.add_argument("--dim", type=int, default=128)
     ap.add_argument("--queries", type=int, default=100)
     ap.add_argument("--npy", default=None, help="archivo .npy (N, D) con embeddings reales")
+    ap.add_argument("--csv", default=None, help="corpus CSV (lang,id,title,text): usa sus embeddings SBERT")
+    ap.add_argument("--metric", default="L2", choices=["L2", "COSINE"])
+    ap.add_argument("--tag", default=None, help="sufijo de los CSV (por defecto 'sbert' con --csv)")
     args = ap.parse_args()
-    ann, hib = run(args.n, args.dim, args.queries, args.npy)
-    _volcar("exp8_ann", ann)
-    _volcar("exp8_hibrido", hib)
+    npy = embeddings_de_csv(args.csv) if args.csv else args.npy
+    tag = args.tag or ("sbert" if args.csv else None)
+    ann, hib = run(args.n, args.dim, args.queries, npy, metric=args.metric)
+    sufijo = f"_{tag}" if tag else ""
+    _volcar(f"exp8_ann{sufijo}", ann)
+    _volcar(f"exp8_hibrido{sufijo}", hib)
 
 
 if __name__ == "__main__":

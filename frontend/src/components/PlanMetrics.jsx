@@ -12,6 +12,9 @@ const ETIQUETA = {
   IVFScan: 'Búsqueda ANN (IVF)',
   PreFilter: 'Híbrido: pre-filtrado',
   PostFilter: 'Híbrido: post-filtrado',
+  InvertedIndexScan: 'Índice invertido (MATCH)',
+  TextSeqScan: 'Full Text Scan',
+  TextPreFilter: 'Híbrido: texto → k-NN',
 }
 
 // Detalles del plan vectorial/hibrido que vale la pena mostrar, en orden.
@@ -25,6 +28,19 @@ const DETALLES = [
   ['prefilter_access', 'acceso del pre-filtro'],
   ['residual_filters', 'filtros residuales'],
   ['sort', 'ordenamiento'],
+  ['forced', 'forzado'],
+]
+
+// Detalles del MATCH (plan.text), en orden.
+const DETALLES_TEXTO = [
+  ['mode', 'tipo de consulta', (v) => (v === 'boolean' ? 'booleana' : 'ranking (OR)')],
+  ['terms', 'términos (raíces)'],
+  ['matches', 'documentos que cumplen'],
+  ['lists_read', 'listas de posteo leídas'],
+  ['postings_read', 'postings leídos'],
+  ['rows_fetched', 'filas traídas de la tabla'],
+  ['scoring', 'ranking'],
+  ['rebuilt', 'mantenimiento'],
 ]
 
 function IoSplit({ io }) {
@@ -49,7 +65,8 @@ function IoSplit({ io }) {
 
 function claseAcceso(access) {
   if (access === 'SeqScan') return 'access scan'
-  if (access.startsWith('Index') || access === 'IVFScan') return 'access pending'
+  if (access === 'TextSeqScan') return 'access scan'
+  if (access.startsWith('Index') || access === 'IVFScan' || access === 'InvertedIndexScan') return 'access pending'
   return 'access'
 }
 
@@ -81,8 +98,17 @@ export default function PlanMetrics({ result }) {
   const fullScan = plan.pages ?? null
   // Solo tiene sentido comparar cuando la ruta elegida NO es el escaneo completo:
   // es ahi donde el planificador esta afirmando haber ahorrado I/O.
-  const comparable = fullScan && !['SeqScan', 'KnnSeqScan'].includes(plan.access) && leidos > 0
-  const detalles = DETALLES.filter(([k]) => plan[k] !== undefined && plan[k] !== null)
+  const comparable = fullScan && !['SeqScan', 'KnnSeqScan', 'TextSeqScan'].includes(plan.access) && leidos > 0
+  const valor = (v) => (Array.isArray(v) ? v.join(', ') : String(v))
+  const detalles = DETALLES.filter(([k]) => plan[k] !== undefined && plan[k] !== null).map(
+    ([k, etiqueta]) => [k, etiqueta, valor(plan[k])],
+  )
+  if (plan.text) {
+    for (const [k, etiqueta, fmt] of DETALLES_TEXTO) {
+      const v = plan.text[k]
+      if (v !== undefined && v !== null) detalles.push([`text.${k}`, etiqueta, fmt ? fmt(v) : valor(v)])
+    }
+  }
   const tope = comparable ? Math.max(leidos, fullScan) : 0
 
   return (
@@ -96,10 +122,10 @@ export default function PlanMetrics({ result }) {
         {plan.io && (plan.io.index_reads > 0 || plan.io.table_reads > 0) && <IoSplit io={plan.io} />}
         {detalles.length > 0 && (
           <dl className="plan-facts">
-            {detalles.map(([k, etiqueta]) => (
+            {detalles.map(([k, etiqueta, v]) => (
               <div key={k}>
                 <dt>{etiqueta}</dt>
-                <dd>{Array.isArray(plan[k]) ? plan[k].join(', ') : String(plan[k])}</dd>
+                <dd>{v}</dd>
               </div>
             ))}
           </dl>

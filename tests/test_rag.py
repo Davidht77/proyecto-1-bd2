@@ -74,7 +74,7 @@ def test_build_crea_tabla_ivf_e_indice_invertido(rag):
     assert st["ready"] and st["n_docs"] == 24
     assert st["dense_index"]["kind"] == "IVF" and st["dense_index"]["metric"] == "COSINE"
     assert st["inverted"]["n_docs"] == 24 and st["inverted"]["postings"] > 0
-    assert {"spimi.post", "spimi.vocab.btree.dat", "norms.dat"} <= set(st["inverted_bytes"])
+    assert {"postings.inv", "vocab.dic", "norms.dat"} <= set(st["inverted_bytes"])
     # el catalogo no ve el vocabulario como un B+ de la tabla
     assert all(i["kind"] in ("IVF",) for i in rag.catalog.indexes_of("documentos"))
 

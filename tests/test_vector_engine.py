@@ -235,10 +235,45 @@ def test_where_multicolumna_con_filtro_residual_y_order_by(db):
     assert [row[1] for row in r.rows] == [29.0, 29.0, 25.0]  # ids 29 y 529
 
 
-def test_match_pendiente_y_within_radius_valida_columna_espacial(db):
-    with pytest.raises(NotImplementedFeature, match="textual"):
-        db.execute("SELECT id FROM prod WHERE cat MATCH 'zapatillas'")
-    # WITHIN_RADIUS ya está implementado: sobre una columna que no es POINT
-    # debe rechazarse con un error de ejecución, no con un 501.
+def test_match_y_within_radius_validan_el_tipo_de_columna(db):
+    # MATCH y WITHIN_RADIUS ya se ejecutan: sobre una columna del tipo
+    # equivocado deben rechazarse con un error de ejecucion, no con un 501.
+    with pytest.raises(SQLRuntimeError, match="texto"):
+        db.execute("SELECT id FROM prod WHERE precio MATCH 'zapatillas'")
     with pytest.raises(SQLRuntimeError, match="POINT"):
         db.execute("SELECT id FROM prod WHERE cat WITHIN_RADIUS((1, 2), 3)")
+
+
+def test_match_combinado_con_knn_vectorial(db):
+    """Hibrido multivariable: texto + relacional + vector en una sola consulta."""
+    q = db.X[3]
+    r = db.execute(f"SELECT id, cat FROM prod WHERE cat MATCH 'bags' AND precio < 200 "
+                   f"ORDER BY emb <-> '{_vec(q)}' LIMIT 4")
+    assert r.plan.access == "TextPreFilter"
+    mask = np.array([i % 4 == 2 and (i % 500) < 200 for i in range(N)])
+    assert _ids(r) == _exacto(db.X, q, "L2", 4, mask)
+
+
+# ------------------------------------------ SET vector.scan: k-NN exacto forzado
+
+
+def test_vector_scan_exact_ignora_el_ivf_con_la_misma_metrica(db):
+    db.execute("CREATE INDEX iv ON prod (emb) USING IVF WITH (lists = 16, metric = 'COSINE')")
+    db.execute("SET ivf.probes = 1")
+    q = db.X[7] + 0.05
+    sql = f"SELECT id, emb <=> '{_vec(q)}' AS d FROM prod ORDER BY d LIMIT 10"
+    assert db.execute(sql).plan.access == "IVFScan"
+    db.execute("SET vector.scan = 'EXACT'")
+    r = db.execute(sql)
+    assert r.plan.access == "KnnSeqScan"
+    assert "forced" in r.plan.detail
+    assert _ids(r) == _exacto(db.X, q, "COSINE", 10)
+    # la distancia reportada es coseno, no L2
+    assert r.rows[0][1] == pytest.approx(float(distances(q, db.X[[r.rows[0][0]]], "COSINE")[0]), abs=1e-5)
+    db.execute("SET vector.scan = 'AUTO'")
+    assert db.execute(sql).plan.access == "IVFScan"
+
+
+def test_vector_scan_valida_valores(db):
+    with pytest.raises(SQLRuntimeError, match="vector.scan"):
+        db.execute("SET vector.scan = 'SOMETIMES'")

@@ -5,7 +5,15 @@ los módulos multimodales del Entregable 2: espacial (R-Tree), textual (índice
 invertido), vectorial (IVF) y la **aplicación de IA** (RAG sobre Wikipedia) con el
 módulo multimedia (BoVW vs. embeddings densos).
 
-## Levantar el sistema
+## Levantar el sistema (un solo paso)
+
+```bash
+./run.sh          # Linux / macOS / Git Bash
+.\run.ps1         # Windows PowerShell
+```
+
+El script crea `.venv`, instala `requirements.txt`, construye el frontend y levanta la
+API. Requisitos: Python ≥ 3.11 y Node ≥ 18. Equivale a:
 
 ```bash
 pip install -r requirements.txt
@@ -28,6 +36,31 @@ Tests: `python -m pytest -q`
 Variables de entorno: `BD2_DATA_DIR` (por defecto `data`), `BD2_PAGE_SIZE` (4096) y
 `BD2_CACHE_SIZE` (0 = sin buffer pool, que es como deben correr los benchmarks).
 
+## Estructura del repositorio
+
+| Carpeta | Contenido |
+|---|---|
+| `backend/` | motor (almacenamiento, archivos, índices, SQL, módulos textual/vectorial/multimedia, RAG) y API REST (FastAPI) |
+| `frontend/` | cliente web React + Vite (SQL, mapa Leaflet, RAG, multimedia) |
+| `data/` | archivos binarios del motor y datasets descargados (ver `data/README.md`) |
+| `benchmarks/results/` | CSV de los Experimentos 1–8; el código está en `backend/benchmarks/` |
+| `informe_analisis/` | informes LaTeX: `informe_analisis.tex` (P1) e `informe_p2.tex` (P2), con sus PDF |
+| `tests/` | `python -m pytest -q` |
+
+## Cobertura del enunciado (Entregable 2)
+
+| Enunciado | Dónde |
+|---|---|
+| 5.1 R-Tree en disco: MBR, split cuadrático, rango/radio, k-NN por `MINDIST`, mapa Leaflet | `backend/index/rtree.py`, `geo.py`, `frontend/src/components/MapView.jsx` |
+| 5.2 Índice invertido: tokenización, stopwords, stemming Snowball, SPIMI, `vocab.dic` + `postings.inv`, booleano AND/OR/AND-NOT en O(n+m), TF-IDF + coseno (normas L2 en disco), BM25 | `backend/text/` |
+| 5.3 BoVW (SIFT + K-Means + TF-IDF sobre el índice invertido), embeddings densos (ResNet-18, SBERT), k-NN exacto con Max-Heap, IVF en disco | `backend/multimedia/`, `backend/vector/` |
+| 5.4 `USING RTREE \| INVERTED \| IVF`, `WITHIN_RADIUS`, `KNN`, `MATCH`, `COSINE_SCORE()`, `<->`, `<=>`, `SET ivf.probes`, planificador PRE/POST con I/O de índice vs tabla | `backend/engine/` |
+| 5.5 Aplicación de IA: RAG (opción A) sobre 15 000 artículos, léxico vs semántico, LLM con fuentes y métricas de I/O | `backend/rag/`, `frontend/src/components/RagPanel.jsx` |
+| 6 Experimentos 5–8 | `backend/benchmarks/experiment{5,6,7,8}.py` → `benchmarks/results/` → `informe_analisis/figuras/generar_p2.py` |
+
+HNSW (opción 2 de 5.3) no se implementó: el enunciado pide al menos una estructura ANN y
+se eligió IVF.
+
 ## SQL soportado
 
 ```sql
@@ -45,13 +78,19 @@ INSERT INTO locales VALUES (1, 'Miraflores', POINT(-77.0282, -12.1354));
 CREATE INDEX idx_geo ON locales (ubicacion) USING RTREE;
 SELECT * FROM locales WHERE ubicacion WITHIN_RADIUS ((-77.0282, -12.1354), 2.5);
 SELECT * FROM locales WHERE ubicacion KNN ((-77.0282, -12.1354), 10);
+
+-- módulo textual
+CREATE INDEX idx_texto ON documentos (texto) USING INVERTED WITH (scoring = 'TFIDF_COSINE');
+SELECT id, titulo, COSINE_SCORE() AS relevancia FROM documentos
+WHERE texto MATCH 'aprendizaje AND profundo AND NOT basico'
+ORDER BY relevancia DESC LIMIT 10;
 ```
 
 `USING HEAP` y `USING SEQUENTIAL` funcionan. `CREATE INDEX ... USING HASH` construye
 un Hashing Dinámico sobre disco y habilita `IndexScan` en el planificador.
 `CREATE INDEX ... USING BTREE` construye el árbol B+; `USING RTREE` indexa columnas
-`POINT`. `MATCH`, `WITHIN_RADIUS` y `KNN` se parsean; los predicados espaciales ya
-se ejecutan y `MATCH` sigue pendiente del módulo textual.
+`POINT`; `USING INVERTED` indexa columnas de texto para `MATCH`. `WITHIN_RADIUS`,
+`KNN` y `MATCH` se ejecutan con su índice o, si no hay, con un recorrido de la tabla.
 
 ## API REST
 
@@ -64,8 +103,10 @@ se ejecutan y `MATCH` sigue pendiente del módulo textual.
 | `GET` | `/api/tables/{t}/pages` | funcionando — inspección de páginas físicas |
 | `POST` | `/api/tables/{t}/seed` | funcionando — carga de datos sintéticos |
 | `GET` | `/api/health` | funcionando |
-| `POST` | `/api/benchmarks/run` | **501** — necesita B+ (usa Heap/Sequential/Hash mientras tanto) |
-| `GET` | `/api/tables/{t}/index/{n}` | funcionando para `RTREE` (altura, MBR y nodos); 501 para el resto |
+| `POST` | `/api/benchmarks/run` | funcionando — Experimentos 1–5 (`{"experiment": 0}` = todos) |
+| `GET` | `/api/tables/{t}/index/{n}` | funcionando para `RTREE` (altura, MBR y nodos); el resto se inspecciona desde el plan |
+| `GET`/`POST` | `/api/rag/*` | aplicación RAG (estado, construcción, pregunta) |
+| `GET`/`POST` | `/api/multimedia/*` | tienda de imágenes (BoVW vs ResNet-18 + IVF) |
 
 Documentación interactiva en `/docs`.
 
@@ -92,7 +133,7 @@ Documentación interactiva en `/docs`.
 
 | Módulo | Responsabilidad | Estado |
 |---|---|---|
-| `btree.py` | Árbol B+ multinivel en disco | **pendiente** |
+| `btree.py` | Árbol B+ multinivel en disco (split, punto, rango por `next_leaf`) | listo |
 | `hash.py` | Extendible Hashing | listo (sebastian) |
 | `rtree.py` | R-Tree espacial persistido (MBR, split cuadrático, k-NN) | listo |
 | `geo.py` | Haversine, caja de radio y `MINDIST` geográfico | listo |
@@ -128,6 +169,7 @@ CREATE INDEX idx_vec ON multimedia (embedding) USING IVF WITH (lists = 100, metr
 
 SET ivf.probes = 5;                 -- celdas que escanea el IVF
 SET hybrid.strategy = 'AUTO';       -- AUTO | PRE | POST (forzar, para experimentos)
+SET vector.scan = 'AUTO';           -- AUTO | EXACT (ignora el IVF: k-NN exacto, misma métrica)
 
 SELECT id, categoria, precio, embedding <=> '[0.12, -0.34, ...]' AS dist_coseno
 FROM multimedia
@@ -148,6 +190,12 @@ ruta de acceso y evalúa el resto como filtro residual. También hay `ORDER BY <
 | `WHERE` indexable, sin IVF | `PreFilter` | B+/Hash/clave entrega candidatos → k-NN exacto |
 | `WHERE` no indexable, con IVF | `PostFilter` | candidatos IVF en orden → filtro; amplía el sondeo si no alcanza |
 | `WHERE` indexable y con IVF | `PreFilter` / `PostFilter` | decide `hybrid.choose_strategy` con un conteo real del índice |
+| `MATCH` + distancia | `TextPreFilter` | el índice invertido filtra → k-NN exacto sobre los candidatos |
+
+`hybrid.choose_strategy` estima los bloques de cada estrategia: PRE ≈ filas que cumplen
+el filtro (una lectura de tabla por fila); POST ≈ páginas de las celdas necesarias para
+revisar k/selectividad candidatos + una lectura de tabla por candidato. Gana la menor;
+ante un empate, PRE (es exacto).
 
 Cada consulta reporta en `plan.io` las lecturas **del índice** y **de la tabla** por
 separado (enunciado 5.4). El panel de métricas del cliente web las dibuja.
@@ -172,10 +220,14 @@ separado (enunciado 5.4). El panel de métricas del cliente web las dibuja.
 ```bash
 python -m backend.benchmarks.experiment8                  # sintético, N=20k, D=128
 python -m backend.benchmarks.experiment8 --npy emb.npy    # embeddings reales (N, D)
+python -m backend.benchmarks.experiment8 --csv data/datasets/wiki_20k.csv --metric COSINE
+#   embeddings SBERT del corpus del RAG (se calculan una vez en <csv>.sbert.npy);
+#   las consultas son documentos reales que se dejan fuera de la tabla
 ```
 
 Escribe `benchmarks/results/exp8_ann.csv` (Recall@10 / ms / bloques vs `probes`, con el
-k-NN exacto como verdad de campo) y `exp8_hibrido.csv` (PRE vs POST según selectividad).
+k-NN exacto como verdad de campo) y `exp8_hibrido.csv` (PRE vs POST según selectividad);
+con `--csv`, `exp8_ann_sbert.csv` y `exp8_hibrido_sbert.csv`.
 
 ## Aplicación de IA y módulo multimedia (Rol 4)
 
@@ -210,7 +262,7 @@ Lo que queda en disco, todo dentro del motor:
 |---|---|---|
 | `documentos (id, lang, titulo CHAR(80), texto CHAR(1000), emb VECTOR(384))` | `data/documentos.heap.dat` | fragmentos que cita el RAG |
 | `documentos__idx_emb.ivf.*` | `data/` | recuperación semántica (SBERT + IVF COSINE) |
-| `documentos__texto.spimi.vocab.btree.dat` + `.spimi.post` + `.norms.dat` | `data/text/` | recuperación léxica (TF-IDF coseno y BM25 sobre el SPIMI de la Parte 3) |
+| `documentos__texto.vocab.dic` + `.postings.inv` + `.norms.dat` | `data/text/` | recuperación léxica (TF-IDF coseno y BM25 sobre el SPIMI de la Parte 3) |
 | `imagenes (id, categoria, archivo, emb VECTOR(512))` | `data/imagenes.heap.dat` | ResNet-18 de cada imagen |
 | `imagenes__idx_emb.ivf.*` | `data/` | paradigma moderno (IVF COSINE) |
 | `codebook_bovw (id, centro VECTOR(128))` | `data/codebook_bovw.heap.dat` | K palabras visuales (K-Means sobre SIFT) |
@@ -318,19 +370,41 @@ dimensionalidad para D = 2…128). Las figuras y el informe están en
 `informe_analisis/experimento5_rtree.tex` (requiere `matplotlib` para
 `informe_analisis/figuras/generar.py`).
 
-### Contrato para el módulo textual
+### Módulo textual en SQL (índice invertido)
 
-`MATCH '<consulta>'` y `COSINE_SCORE()` ya se parsean (`TextMatch`, `ScoreExpr`
-en `parser.py`). El executor sigue respondiendo 501 hasta conectar el índice
-invertido. Para hacerlo: registrar el índice en `Catalog.indexes_of()` y
-reemplazar el `NotImplementedFeature` de `Executor._select`.
+Enunciado 5.2 y 5.4. Código en `backend/text/` (`boolean.py`, `inverted.py`, SPIMI) y
+`Executor._select_text`.
 
-El RAG y el BoVW ya usan el SPIMI (`backend/text/spimi.py`) tal como está:
-`build_index(..., tokenize=)` acepta un tokenizador alternativo (las palabras
-visuales no pasan por stopwords ni stemming) y `backend/multimedia/tfidf.py`
-agrega el archivo de normas y el CosineScore sobre esos mismos postings. Cuando
-`MATCH` se conecte al planificador, `RagService.retrieve_lexical` puede pasar a
-ejecutarse como SQL sin cambiar el resto del pipeline.
+- `CREATE INDEX ... USING INVERTED WITH (scoring = 'TFIDF_COSINE' | 'BM25')` sobre una
+  columna `CHAR`. Archivos: `<t>__<idx>.inv.meta` (columna, scoring, si está
+  desactualizado), diccionario `vocab.dic` (B+ paginado término → offset, df; el largo
+  de la lista es df), listas de posteo `postings.inv` ordenadas por RID y normas
+  (`.inv.norms.dat`).
+- `MATCH` con operadores (`AND`, `OR`, `NOT`, paréntesis; en mayúsculas) es booleano y
+  se resuelve con mezclas de dos punteros en O(n + m); sin operadores es una consulta de
+  ranking (OR de las palabras). `COSINE_SCORE()` / `BM25_SCORE()` eligen el score.
+- Ruta `InvertedIndexScan` (filtro y refinamiento): el índice da los documentos y su
+  score sin tocar la tabla; después se leen las filas por RID en orden de relevancia,
+  se aplican los demás predicados y con `LIMIT` se para al juntar k. Sin índice:
+  `TextSeqScan` (mismo resultado, lee toda la tabla).
+- Un `INSERT`, `DELETE` o reorganización marca el índice como desactualizado y el
+  siguiente `MATCH` lo reconstruye (el plan lo indica).
+
+El RAG y el BoVW usan los mismos archivos SPIMI: `build_index(..., tokenize=)` acepta un
+tokenizador alternativo (las palabras visuales no pasan por stopwords ni stemming).
+
+### Experimento 6
+
+```bash
+docker run -d --name bd2-pg -e POSTGRES_PASSWORD=bd2 -e POSTGRES_DB=bd2 -p 55432:5432 postgres:16-alpine
+python -m backend.benchmarks.experiment6 --csv data/datasets/wiki_20k.csv   # corpus: python -m backend.rag.download --n 10000 --out data/datasets/wiki_20k.csv
+python -m backend.benchmarks.experiment6 --no-pg                            # sin PostgreSQL
+```
+
+Escribe `exp6_construccion.csv` (tiempo y tamaño del índice vs GIN, 1k → 20k documentos)
+y `exp6_consultas.csv` (AND, OR, AND-NOT y Top-10 de 1, 3 y 5 términos: índice vs Full
+Text Scan vs GIN). PostgreSQL es solo la referencia externa del enunciado (necesita
+`psycopg2`); el motor no lo usa.
 
 ## Contrato con el resto del equipo
 
@@ -347,15 +421,6 @@ page = pg.new_page(PageType.BT_LEAF)   # asigna sin leer de vuelta
 pg.write_page(page)                     # counter.disk_writes += 1
 page = pg.read_page(page.page_id)       # counter.disk_reads  += 1
 ```
-
-### Para quien implemente el B+ Tree
-
-- `page.next_page_id` / `page.prev_page_id` de la cabecera **ya son** los
-  `next_leaf_id` / `prev_leaf_id` que pide el enunciado para el recorrido por rango.
-- `pager.user_a` / `pager.user_b` son dos `uint32` persistentes en la cabecera del
-  archivo: usa `user_a` como `root_page_id`.
-- `page_capacity(page_size, record_size)` da el fan-out directamente, para la tabla del
-  Experimento 4.
 
 ### Hash Extensible
 
@@ -378,17 +443,6 @@ directorio. `Catalog.create_index`/`open_index` lo conectan al motor;
 | Fill factor | 0.75 uniforme | Enunciado 3.2.2 (70–80 %) |
 | Buffer pool | Opcional, apagado por defecto | Benchmarks sin caché validan la teoría; la demo con caché va rápida |
 
-Detalle completo en `docs/superpowers/specs/` y `docs/superpowers/plans/`.
-
-## Qué falta para cerrar el Proyecto 1
-
-- `BPlusTree` en `backend/index/btree.py`
-- Suite de los 4 experimentos (`POST /api/benchmarks/run`)
-
-Cada archivo pendiente documenta sus requisitos del enunciado y qué le da ya la capa de
-almacenamiento. Para conectar un índice nuevo al motor basta con registrarlo en
-`Catalog.indexes_of()` e implementar su rama en `Executor._rows_for()`: el planificador
-ya elige `IndexScan` e `IndexRangeScan` en cuanto detecta el índice.
 
 ## Limitaciones conocidas
 

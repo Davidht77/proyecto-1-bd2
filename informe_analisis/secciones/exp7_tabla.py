@@ -42,13 +42,14 @@ if p.exists():
         for r in filas)
     partes.append(f"""\\begin{{table}}[H]
 \\centering\\footnotesize\\setlength{{\\tabcolsep}}{{4pt}}
+\\resizebox{{\\textwidth}}{{!}}{{%
 \\begin{{tabular}}{{lrrrrrrr}}
 \\toprule
 Método & P@5 (\\%) & P@10 (\\%) & extracción (ms/img) & consulta (ms) & bloques & índice / tabla & índice (KB) \\\\
 \\midrule
 {cuerpo}
 \\bottomrule
-\\end{{tabular}}
+\\end{{tabular}}}}
 \\caption{{Experimento 7a (\\code{{exp7\\_imagenes.csv}}): Caltech-101, {n} imágenes de {nc} categorías, {nq} consultas. Precisión = fracción del top-$k$ con la misma categoría que la consulta (sin contar la propia imagen).}}
 \\label{{tab:exp7a}}
 \\end{{table}}""")
@@ -64,13 +65,14 @@ if p.exists():
         for r in filas)
     partes.append(f"""\\begin{{table}}[H]
 \\centering\\footnotesize\\setlength{{\\tabcolsep}}{{4pt}}
+\\resizebox{{\\textwidth}}{{!}}{{%
 \\begin{{tabular}}{{lrrrrrrr}}
 \\toprule
 Método & hit@1 (\\%) & hit@10 (\\%) & MRR@10 & consulta$\\to$vector (ms) & búsqueda (ms) & bloques & índice / tabla \\\\
 \\midrule
 {cuerpo}
 \\bottomrule
-\\end{{tabular}}
+\\end{{tabular}}}}
 \\caption{{Experimento 7b (\\code{{exp7\\_texto.csv}}): Wikipedia es/en, {n} artículos, {nq} consultas de ítem conocido (la consulta es el título; acierto = recuperar ese artículo).}}
 \\label{{tab:exp7b}}
 \\end{{table}}""")
