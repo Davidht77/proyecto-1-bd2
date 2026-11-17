@@ -397,7 +397,9 @@ tokenizador alternativo (las palabras visuales no pasan por stopwords ni stemmin
 
 ```bash
 docker run -d --name bd2-pg -e POSTGRES_PASSWORD=bd2 -e POSTGRES_DB=bd2 -p 55432:5432 postgres:16-alpine
-python -m backend.benchmarks.experiment6 --csv data/datasets/wiki_20k.csv   # corpus: python -m backend.rag.download --n 10000 --out data/datasets/wiki_20k.csv
+pip install pyarrow   # solo para leer el parquet de Wikipedia
+python -m backend.text.wikipedia --parquet --n 50000 --out data/text/wiki_100k.csv
+python -m backend.benchmarks.experiment6 --csv data/text/wiki_100k.csv --sizes 1000 10000 25000 50000 100000   # ~2,5 h
 python -m backend.benchmarks.experiment6 --no-pg                            # sin PostgreSQL
 ```
 

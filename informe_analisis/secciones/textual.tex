@@ -133,9 +133,10 @@ inserción obligaría a reescribirlas.
 
 \subsection{Experimento 6: índice invertido vs.\ Full Text Scan vs.\ GIN}
 
-\paragraph{Metodología.} Corpus de 20\,000 artículos de Wikipedia (10\,000 en español y
-10\,000 en inglés, los primeros 1000 bytes de cada uno), descargados con
-\code{backend/rag/download.py}. Todo corre por SQL a través del executor
+\paragraph{Metodología.} Corpus de 100\,000 artículos de Wikipedia (50\,000 en español y
+50\,000 en inglés, los primeros 1000 bytes de cada uno), leídos del primer archivo parquet
+de cada idioma con \code{backend/text/wikipedia.py}. Fuente: volcado
+\code{wikimedia/wikipedia} 20231101 (Hugging Face), licencia CC BY-SA 4.0. Todo corre por SQL a través del executor
 (\code{backend/benchmarks/experiment6.py}), con páginas de 4\,KB y sin buffer pool. La
 referencia externa es PostgreSQL~16 en un contenedor, con una columna
 \code{tsvector} generada con el diccionario del idioma de cada documento y un índice GIN
@@ -155,11 +156,11 @@ latencia casi no varía entre consultas.
 Documentos & \multicolumn{2}{c}{Índice invertido} & \multicolumn{2}{c}{GIN (PostgreSQL)} & Escrituras \\
  & tiempo (s) & tamaño (MB) & tiempo (s) & tamaño (MB) & del índice \\
 \midrule
-1\,000 & 10,3 & 1,9 & 0,06 & 1,1 & 14\,618 \\
-2\,500 & 24,5 & 4,2 & 0,12 & 2,3 & 27\,303 \\
-5\,000 & 45,8 & 7,6 & 0,24 & 3,9 & 44\,008 \\
-10\,000 & 84,6 & 13,8 & 0,52 & 6,4 & 68\,813 \\
-20\,000 & 167,9 & 27,8 & 1,11 & 13,5 & 140\,340 \\
+1\,000 & 11,3 & 1,9 & 0,07 & 1,1 & 14\,618 \\
+10\,000 & 93,6 & 13,8 & 0,56 & 6,4 & 68\,813 \\
+25\,000 & 231,1 & 31,9 & 1,60 & 13,8 & 136\,513 \\
+50\,000 & 458,7 & 61,8 & 3,23 & 25,5 & 234\,516 \\
+100\,000 & 1\,052,8 & 123,6 & 8,60 & 43,4 & 468\,239 \\
 \bottomrule
 \end{tabular}
 \caption{Experimento 6a (\code{exp6\_construccion.csv}): construcción del índice invertido (vocabulario + postings + normas) y del GIN.}
@@ -168,17 +169,19 @@ Documentos & \multicolumn{2}{c}{Índice invertido} & \multicolumn{2}{c}{GIN (Pos
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.95\textwidth]{exp6_construccion}
-\caption{Tiempo de construcción y tamaño en disco al crecer el corpus (escala log-log). Las dos estructuras crecen linealmente con el número de documentos.}
+\caption{Tiempo de construcción y tamaño en disco al crecer el corpus (escala log-log). El índice invertido crece linealmente en tamaño; el GIN crece más lento porque comprime mejor las listas largas.}
 \end{figure}
 
-Los dos índices crecen linealmente: el nuestro cuesta unos 8,4\,ms y 1,4\,KB por documento
-y el GIN 0,06\,ms y 0,7\,KB. La diferencia de tamaño es de diseño: nuestros postings son
+El nuestro crece linealmente: unos 10,5\,ms y 1,2\,KB por documento con 100\,000
+documentos. El GIN cuesta 0,09\,ms y 0,4\,KB por documento, y su tamaño crece más lento
+que el corpus (de 1,1 a 0,4\,KB por documento) porque las listas largas se comprimen
+mejor. La diferencia de tamaño es de diseño: nuestros postings son
 registros fijos de 16 bytes sin comprimir que guardan además $tf$ y $|d|$ (los necesita el
 ranking sin tocar la tabla), el vocabulario usa claves \code{CHAR(24)} de ancho fijo y hay
 un archivo de normas; el GIN comprime las listas (deltas codificados en bytes variables) y
-no guarda frecuencias. La diferencia de tiempo (150 veces) viene de que el vocabulario se
-arma insertando término por término en el B+ del Proyecto~1 desde Python (140\,340
-escrituras de bloque para 20\,000 documentos), mientras que PostgreSQL ordena en memoria y
+no guarda frecuencias. La diferencia de tiempo (unas 120 veces) viene de que el vocabulario se
+arma insertando término por término en el B+ del Proyecto~1 desde Python (468\,239
+escrituras de bloque para 100\,000 documentos), mientras que PostgreSQL ordena en memoria y
 construye el árbol de abajo hacia arriba en C.
 
 \paragraph{Consultas.}
@@ -190,19 +193,19 @@ construye el árbol de abajo hacia arriba en C.
  & & \multicolumn{2}{c}{Índice invertido} & \multicolumn{2}{c}{GIN} & \multicolumn{2}{c}{Full Text Scan} & \\
 Términos & Operación & ms & bloques & ms & bloques & ms & bloques & coinciden \\
 \midrule
-1 & AND (un término) & 72,3 & 256 & 0,3 & 203 & 40\,207 & 5000 & 250 \\
-1 & Top-10 & 8,3 & 22 & 16,3 & 3\,094 & 40\,207 & 5000 & 606 \\
-3 & AND & 7,4 & 32 & 0,1 & 21 & 40\,361 & 5000 & 2 \\
-3 & AND-NOT & 17,5 & 71 & 0,1 & 42 & 40\,792 & 5000 & 40 \\
-3 & OR & 61,3 & 252 & 0,2 & 219 & 40\,684 & 5000 & 229 \\
-3 & Top-10 & 12,1 & 39 & 85,0 & 14\,525 & 41\,788 & 5000 & 1\,588 \\
-5 & AND & 9,7 & 48 & 0,1 & 32 & 40\,742 & 5000 & 1 \\
-5 & AND-NOT & 10,8 & 51 & 0,1 & 35 & 40\,478 & 5000 & 4 \\
-5 & OR & 136,1 & 577 & 10,8 & 2\,212 & 40\,569 & 5000 & 539 \\
-5 & Top-10 & 16,4 & 55 & 160,0 & 23\,220 & 40\,801 & 5000 & 2\,380 \\
+1 & AND (un término) & 273,7 & 4\,155 & 60,3 & 11\,905 & 262\,794 & 25\,000 & 4\,133 \\
+1 & Top-10 & 20,5 & 45 & 42,3 & 5\,257 & 283\,671 & 25\,000 & 2\,142 \\
+3 & AND & 23,0 & 87 & 0,3 & 40 & 280\,511 & 25\,000 & 20 \\
+3 & AND-NOT & 53,0 & 268 & 3,5 & 197 & 265\,128 & 25\,000 & 191 \\
+3 & OR & 80,2 & 1\,728 & 14,7 & 1\,388 & 253\,852 & 25\,000 & 1\,682 \\
+3 & Top-10 & 29,9 & 72 & 146,0 & 14\,871 & 304\,178 & 25\,000 & 5\,723 \\
+5 & AND & 39,8 & 105 & 1,6 & 41 & 261\,475 & 25\,000 & 1 \\
+5 & AND-NOT & 44,3 & 122 & 1,9 & 50 & 258\,904 & 25\,000 & 11 \\
+5 & OR & 55,0 & 1\,022 & 2,8 & 829 & 253\,416 & 25\,000 & 969 \\
+5 & Top-10 & 47,7 & 102 & 389,2 & 67\,941 & 252\,532 & 25\,000 & 9\,727 \\
 \bottomrule
 \end{tabular}
-\caption{Experimento 6b (\code{exp6\_consultas.csv}), $N=20\,000$: latencia y bloques por consulta. ``Coinciden'' es el promedio de documentos que cumplen el \code{MATCH} con el índice. Bloques de 4\,KB en nuestro motor y de 8\,KB en PostgreSQL.}
+\caption{Experimento 6b (\code{exp6\_consultas.csv}), $N=100\,000$: latencia y bloques por consulta. ``Coinciden'' es el promedio de documentos que cumplen el \code{MATCH} con el índice. Bloques de 4\,KB en nuestro motor y de 8\,KB en PostgreSQL.}
 \end{table}
 
 \begin{figure}[H]
@@ -212,25 +215,26 @@ Términos & Operación & ms & bloques & ms & bloques & ms & bloques & coinciden 
 \end{figure}
 
 \paragraph{Análisis.} El Full Text Scan cuesta lo mismo para cualquier consulta: lee las
-5000 páginas de la tabla y vuelve a preprocesar los 20\,000 documentos (tokenizar, quitar
-stopwords, aplicar el stemmer y calcular normas), unos 40 segundos. El índice resuelve las
-mismas consultas entre 300 y 5\,500 veces más rápido y con 9 a 230 veces menos bloques. La
-parte que lee el índice en sí es pequeña (de 7 a 47 bloques: la altura del B+ más las
+25\,000 páginas de la tabla y vuelve a preprocesar los 100\,000 documentos (tokenizar, quitar
+stopwords, aplicar el stemmer y calcular normas), de 253 a 304 segundos. El índice resuelve las
+mismas consultas entre 960 y 13\,800 veces más rápido y con 6 a 560 veces menos bloques. La
+parte que lee el índice en sí es pequeña (de 22 a 111 bloques: la altura del B+ más las
 páginas de las listas de la consulta); el resto son las filas del resultado traídas de la
 tabla, una por documento, porque el \code{SELECT} pide columnas de la tabla. Por eso en
 las consultas booleanas los bloques crecen con el número de documentos que cumplen (un
-\code{OR} de 5 términos trae 539 filas) y quedan muy cerca de los del GIN, que también
-debe visitar el heap por cada fila.
+\code{AND} de un solo término trae 4\,133 filas) y, salvo en ese caso, quedan cerca de los
+del GIN, que también debe visitar el heap por cada fila.
 
-En las consultas de ranking Top-10 el índice gana a GIN en bloques (de 22 a 55 frente a
-3\,094 a 23\,220) y en tiempo (de 8 a 16\,ms frente a 16 a 160\,ms). El score sale entero de
+En las consultas de ranking Top-10 el índice gana a GIN en bloques (de 45 a 102 frente a
+5\,257 a 67\,941) y en tiempo (de 20 a 48\,ms frente a 42 a 389\,ms). El score sale entero de
 los postings ($tf$ y $|d|$) y de las normas, sin tocar la tabla, así que solo se leen las
 10 filas del resultado. \code{ts\_rank} de PostgreSQL, en cambio, necesita el
 \code{tsvector} de cada documento que cumple, que vive en el heap: su costo crece con los
-1\,588 o 2\,380 documentos que coinciden y no con $k$. Guardar $tf$ y $|d|$ en cada posting
-cuesta el doble de espacio que el GIN, y esta es la consulta donde se recupera.
+5\,723 o 9\,727 documentos que coinciden y no con $k$. Guardar $tf$ y $|d|$ en cada posting
+cuesta casi el triple de espacio que el GIN (123,6 frente a 43,4\,MB), y esta es la consulta
+donde se recupera.
 
-En las consultas booleanas el GIN es mucho más rápido (menos de 1\,ms frente a 7 a 136\,ms)
+En las consultas booleanas el GIN es mucho más rápido (de 0,3 a 60\,ms frente a 23 a 274\,ms)
 con un número parecido de bloques. Esa diferencia no es de I/O sino de implementación: C
 contra Python, y el buffer pool de PostgreSQL contra nuestro motor sin caché, donde cada
 acceso cuenta como lectura a propósito para que el \code{DiskCounter} mida la estructura y
@@ -238,5 +242,6 @@ no la caché.
 
 Los resultados coinciden: para cada consulta el índice y el Full Text Scan devolvieron
 exactamente los mismos documentos (el script lo verifica), y con GIN el número de
-documentos difiere en menos de 1\,\%, por las pequeñas diferencias entre sus listas de
+documentos difiere en menos de 1\,\% en casi todas las celdas (5\,\% en el Top-10 de un
+término), por las pequeñas diferencias entre sus listas de
 stopwords y diccionarios y los nuestros.
