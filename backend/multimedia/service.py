@@ -308,11 +308,13 @@ class MultimediaStore:
             ex.execute(f"SET ivf.probes = {int(probes)}")
         sql = (f"SELECT id, categoria, archivo, emb <=> '{_vec(vec)}' AS dist FROM {TABLE} "
                f"ORDER BY dist ASC LIMIT {int(k)}")
-        if exact:
-            # sin indice utilizable el planificador cae a KnnSeqScan: se fuerza
-            # consultando con la metrica L2, para la que no hay IVF
-            sql = sql.replace("<=>", "<->")
-        r = ex.execute(sql)
+        # exact: SET vector.scan = 'EXACT' hace que el planificador ignore el IVF y
+        # resuelva el k-NN exacto (KnnSeqScan) con la misma metrica coseno.
+        ex.execute(f"SET vector.scan = '{'EXACT' if exact else 'AUTO'}'")
+        try:
+            r = ex.execute(sql)
+        finally:
+            ex.execute("SET vector.scan = 'AUTO'")
         return {
             "hits": [{"id": row[0], "categoria": row[1], "archivo": row[2], "score": row[3]} for row in r.rows],
             "metrics": _metrics(r),

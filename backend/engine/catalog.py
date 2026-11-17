@@ -39,6 +39,8 @@ from backend.storage.pager import peek_header
 from backend.storage.schema import Column, ColumnType, Schema
 from backend.structures.heap_file import HeapFile
 from backend.structures.sequential_file import SequentialFile
+from backend.text.inverted import SCORINGS, InvertedIndex, encode_rid
+from backend.text.inverted import remove_files as remove_inverted_files
 from backend.vector.distance import METRICS
 from backend.vector.ivf import IVFIndex
 
@@ -97,7 +99,7 @@ class Catalog:
         self.cache_size = cache_size
         self._open: dict[str, SequentialFile] = {}
         self._open_indexes: dict[
-            tuple[str, str], ExtendibleHash | BPlusTree | IVFIndex | RTree
+            tuple[str, str], ExtendibleHash | BPlusTree | IVFIndex | RTree | InvertedIndex
         ] = {}
 
     # ------------------------------------------------------------- rutas
@@ -147,7 +149,7 @@ class Catalog:
     def create_index(
         self, table: str, index_name: str, column: str, kind: str, options: dict | None = None
     ) -> None:
-        if kind not in ("HASH", "BTREE", "IVF", "RTREE"):
+        if kind not in ("HASH", "BTREE", "IVF", "RTREE", "INVERTED"):
             raise NotImplementedFeature(f"CREATE INDEX ... USING {kind} todavía no está implementado.")
         if self._engine_of(table) is None:
             raise TableNotFound(f"la tabla «{table}» no existe")
@@ -175,6 +177,9 @@ class Catalog:
             self._open_indexes[(table, index_name)] = tree
             return
 
+        if kind == "INVERTED":
+            self._open_indexes[(table, index_name)] = self._create_inverted(f, base, col, col_idx, options or {})
+            return
         if kind == "IVF":
             self._create_ivf(f, base, col, col_idx, options or {})
             self._open_indexes[(table, index_name)] = IVFIndex(
@@ -237,11 +242,55 @@ class Catalog:
         finally:
             idx.close()
 
-    def open_index(self, table: str, index_name: str) -> ExtendibleHash | BPlusTree | IVFIndex:
+    def _create_inverted(self, f, base: str, col: Column, col_idx: int, options: dict) -> InvertedIndex:
+        """Indice invertido (SPIMI) sobre una columna CHAR, leyendo la tabla una vez.
+
+        Opcion (WITH ...): scoring = 'TFIDF_COSINE' (por defecto) | 'BM25', el
+        ranking que usa MATCH cuando la consulta no pide un score explicito.
+        """
+        if col.type is not ColumnType.CHAR:
+            raise SQLRuntimeError(f"INVERTED solo indexa columnas de texto (CHAR); «{col.name}» es {col.type.name}")
+        desconocidas = set(options) - {"scoring"}
+        if desconocidas:
+            raise SQLRuntimeError(f"opciones de INVERTED desconocidas: {', '.join(sorted(desconocidas))}")
+        scoring = str(options.get("scoring", "TFIDF_COSINE")).upper()
+        if scoring not in SCORINGS:
+            raise SQLRuntimeError(f"scoring = '{scoring}' no soportado. Usa 'TFIDF_COSINE' o 'BM25'.")
+        idx = InvertedIndex(base, col.name, scoring, page_size=self.page_size, cache_size=self.cache_size)
+        try:
+            idx.build((encode_rid(rid), row[col_idx]) for rid, row in f.scan_with_rid())
+        except BaseException:
+            idx.close()
+            remove_inverted_files(base)
+            raise
+        return idx
+
+    def invalidate_inverted(self, table: str) -> None:
+        """Marca como desactualizados los indices invertidos de la tabla: los
+        RIDs cambiaron (INSERT, DELETE o reorganizacion). El proximo MATCH los
+        reconstruye."""
+        for info in self.indexes_of(table):
+            if info["kind"] == "INVERTED":
+                self.open_index(table, info["name"]).mark_stale()
+
+    def rebuild_inverted(self, table: str, index_name: str) -> InvertedIndex:
+        """Reconstruye un indice invertido desactualizado (tras INSERT/DELETE)."""
+        idx = self.open_index(table, index_name)
+        f = self.open_table(table)
+        col_idx = next(i for i, c in enumerate(f.schema.columns) if c.name.lower() == idx.column.lower())
+        idx.build((encode_rid(rid), row[col_idx]) for rid, row in f.scan_with_rid())
+        return idx
+
+    def open_index(self, table: str, index_name: str) -> ExtendibleHash | BPlusTree | IVFIndex | RTree | InvertedIndex:
         key = (table, index_name)
         if key in self._open_indexes:
             return self._open_indexes[key]
         base = self._index_base(table, index_name)
+        if Path(f"{base}.inv.meta").exists():
+            header = peek_header(f"{base}.inv.meta")
+            idx = InvertedIndex(base, page_size=header["page_size"], cache_size=self.cache_size)
+            self._open_indexes[key] = idx
+            return idx
         if Path(f"{base}.ivf.dir").exists():
             header = peek_header(f"{base}.ivf.dir")
             idx = IVFIndex(base, page_size=header["page_size"], cache_size=self.cache_size)
@@ -282,6 +331,7 @@ class Catalog:
                      Path(f"{base}.ivf.dir"), Path(f"{base}.ivf.lst"), Path(f"{base}.rtree.dat")):
             if path.exists():
                 path.unlink()
+        remove_inverted_files(base)
 
     def row_at(self, table: str, rid: HashRID) -> tuple | None:
         f = self.open_table(table)
@@ -415,8 +465,23 @@ class Catalog:
                 "kind": "RTREE",
                 "implicit": False,
             })
+        for path in self.data_dir.glob(f"{prefix}*.inv.meta"):
+            index_name = path.name[len(prefix) : -len(".inv.meta")]
+            idx = self.open_index(table, index_name)
+            out.append({
+                "name": index_name,
+                "column": idx.column,
+                "kind": "INVERTED",
+                "implicit": False,
+                "scoring": idx.scoring,
+                "stale": idx.stale,
+            })
         for path in self.data_dir.glob(f"{prefix}*.btree.dat"):
             index_name = path.name[len(prefix) : -len(".btree.dat")]
+            if "." in index_name:
+                # Archivos internos de otro indice (el vocabulario B+ del
+                # invertido: <tabla>__<idx>.inv.spimi.vocab.btree.dat).
+                continue
             header = peek_header(str(path))
             out.append({
                 "name": index_name,

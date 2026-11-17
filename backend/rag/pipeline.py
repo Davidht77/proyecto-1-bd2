@@ -112,9 +112,14 @@ class RagService:
         ex = self.executor
         if probes is not None:
             ex.execute(f"SET ivf.probes = {int(probes)}")
-        op = "<->" if exact else "<=>"  # con L2 no hay IVF aplicable: k-NN exacto (KnnSeqScan)
-        r = ex.execute(f"SELECT id, lang, titulo, texto, emb {op} '{_vec(q)}' AS dist "
-                       f"FROM {corpus_mod.TABLE} ORDER BY dist ASC LIMIT {int(k)}")
+        # exact: SET vector.scan = 'EXACT' hace que el planificador ignore el IVF y
+        # resuelva el k-NN exacto (KnnSeqScan) con la misma metrica coseno.
+        ex.execute(f"SET vector.scan = '{'EXACT' if exact else 'AUTO'}'")
+        try:
+            r = ex.execute(f"SELECT id, lang, titulo, texto, emb <=> '{_vec(q)}' AS dist "
+                           f"FROM {corpus_mod.TABLE} ORDER BY dist ASC LIMIT {int(k)}")
+        finally:
+            ex.execute("SET vector.scan = 'AUTO'")
         io = r.plan.detail.get("io", {})
         return {
             "route": "semantic", "hits": [
