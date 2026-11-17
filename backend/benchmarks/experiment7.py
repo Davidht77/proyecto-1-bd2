@@ -85,6 +85,32 @@ def _precision(hits: list[dict], categoria: str, n: int) -> float:
     return sum(h["categoria"] == categoria for h in top) / n if top else 0.0
 
 
+def measure_extraction(root: str, items, codebooks: dict, n: int = 300, seed: int = 0) -> tuple[dict, float]:
+    """ms por imagen de cada paradigma sobre la MISMA muestra y sin otra carga.
+
+    Los tiempos que deja extract_features vienen de la construccion completa y
+    pueden estar contaminados por otros procesos; este es el numero del informe.
+    SIFT + cuantizacion se mide por K; ResNet-18 en lotes de 32, como en la carga.
+    """
+    from backend.multimedia.dense import ImageEmbedder
+
+    base = datasets.categories_dir(root)
+    rng = np.random.default_rng(seed)
+    rutas = [str(items[int(i)].path(base)) for i in rng.choice(len(items), size=min(n, len(items)), replace=False)]
+    sift = bovw.SiftExtractor()
+    sift_ms = {}
+    for k, cb in codebooks.items():
+        t0 = time.perf_counter()
+        for r in rutas:
+            cb.tokens(sift(r))
+        sift_ms[k] = 1000.0 * (time.perf_counter() - t0) / len(rutas)
+    emb = ImageEmbedder()
+    emb.embed(rutas[:8])  # carga del modelo fuera de la medicion
+    t0 = time.perf_counter()
+    emb.embed(rutas)
+    return sift_ms, 1000.0 * (time.perf_counter() - t0) / len(rutas)
+
+
 def _bytes(base: str) -> int:
     return sum(p.stat().st_size for p in Path(base).parent.glob(Path(base).name + ".*"))
 
@@ -105,6 +131,9 @@ def run_images(root: str, ks=KS, probes=PROBES, n_cats: int = 30, per_cat: int =
     rng = np.random.default_rng(seed)
     consultas = [int(i) for c in grandes for i in rng.choice(cats[c], size=min(per_cat, len(cats[c])), replace=False)]
     print(f"  {n} imagenes, {len(cats)} categorias; {len(consultas)} consultas de {len(grandes)} categorias", flush=True)
+
+    sift_ms, dense_ms = measure_extraction(root, items, feats.codebooks, seed=seed)
+    print(f"  extraccion por imagen: SIFT+cuantizacion {sift_ms} ms, ResNet-18 {dense_ms:.1f} ms", flush=True)
 
     tmp = store_dir or tempfile.mkdtemp(prefix="exp7_")
     cat = Catalog(tmp, page_size=4096, cache_size=0)
@@ -138,7 +167,7 @@ def run_images(root: str, ks=KS, probes=PROBES, n_cats: int = 30, per_cat: int =
                 p5.append(_precision(hits, items[q].category, 5)); p10.append(_precision(hits, items[q].category, 10))
                 m = r["metrics"]; ms.append(m["exec_ms"]); rd.append(m["disk_reads"]); ir.append(m["index_reads"]); tr.append(m["table_reads"])
             fila = ImageRow("bovw", k, n, len(cats), len(consultas), statistics.mean(p5), statistics.mean(p10),
-                            feats.sift_ms_per_image, statistics.mean(ms), statistics.pstdev(ms), statistics.mean(rd),
+                            sift_ms[k], statistics.mean(ms), statistics.pstdev(ms), statistics.mean(rd),
                             statistics.mean(ir), statistics.mean(tr), round(build_s, 2), _bytes(base))
             filas.append(fila)
             print(f"  bovw K={k:<4} P@5={fila.p_at_5:.3f} P@10={fila.p_at_10:.3f} {fila.avg_query_ms:.1f} ms "
@@ -156,7 +185,7 @@ def run_images(root: str, ks=KS, probes=PROBES, n_cats: int = 30, per_cat: int =
                 p5.append(_precision(hits, items[q].category, 5)); p10.append(_precision(hits, items[q].category, 10))
                 m = r["metrics"]; ms.append(m["exec_ms"]); rd.append(m["disk_reads"]); ir.append(m["index_reads"]); tr.append(m["table_reads"])
             fila = ImageRow(metodo, param, n, len(cats), len(consultas), statistics.mean(p5), statistics.mean(p10),
-                            feats.dense_ms_per_image, statistics.mean(ms), statistics.pstdev(ms), statistics.mean(rd),
+                            dense_ms, statistics.mean(ms), statistics.pstdev(ms), statistics.mean(rd),
                             statistics.mean(ir), statistics.mean(tr), info["ivf_build_s"] if param else 0.0,
                             _bytes(ivf_base + ".ivf") if param else 0)
             filas.append(fila)

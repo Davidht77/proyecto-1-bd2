@@ -13,7 +13,7 @@ OUT = pathlib.Path(__file__).resolve().parent / "exp7_tabla.tex"
 
 
 def f(x, nd=1):
-    return f"{float(x):,.{nd}f}".replace(",", " ").replace(".", ",")
+    return f"{float(x):,.{nd}f}".replace(",", r"\,").replace(".", ",")
 
 
 def pct(x):
@@ -41,7 +41,7 @@ if p.exists():
         f"{f(int(r['index_bytes']) / 1024, 0)} \\\\"
         for r in filas)
     partes.append(f"""\\begin{{table}}[H]
-\\centering\\small
+\\centering\\footnotesize\\setlength{{\\tabcolsep}}{{4pt}}
 \\begin{{tabular}}{{lrrrrrrr}}
 \\toprule
 Método & P@5 (\\%) & P@10 (\\%) & extracción (ms/img) & consulta (ms) & bloques & índice / tabla & índice (KB) \\\\
@@ -63,7 +63,7 @@ if p.exists():
         f"{f(r['avg_index_reads'], 0)} / {f(r['avg_table_reads'], 0)} \\\\"
         for r in filas)
     partes.append(f"""\\begin{{table}}[H]
-\\centering\\small
+\\centering\\footnotesize\\setlength{{\\tabcolsep}}{{4pt}}
 \\begin{{tabular}}{{lrrrrrrr}}
 \\toprule
 Método & hit@1 (\\%) & hit@10 (\\%) & MRR@10 & consulta$\\to$vector (ms) & búsqueda (ms) & bloques & índice / tabla \\\\

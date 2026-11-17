@@ -12,13 +12,16 @@
         bloques y la rodilla aparece con pocas celdas; el pre-filtrado relacional gana
         con filtros selectivos y el post-filtrado con filtros laxos. El planificador
         híbrido existe para elegir el régimen con datos del propio índice.
-  \item \textbf{Las representaciones aprendidas dominan a las cuantizadas en calidad,
-        no necesariamente en costo.} En el Experimento 7 el embedding denso supera
-        ampliamente a BoVW en Precision@$k$, mientras que la extracción SIFT es más
-        barata y el índice invertido lee pocas páginas por consulta. En el texto, la
-        recuperación léxica sigue siendo la mejor para consultas de ítem conocido y la
-        semántica la complementa en consultas parafraseadas; por eso el RAG muestra
-        ambas rutas lado a lado y permite fusionarlas.
+  \item \textbf{Las representaciones aprendidas dominan a las cuantizadas en imágenes.}
+        En el Experimento 7 ResNet-18 obtiene una Precision@10 de 86\,\% frente al
+        8--17\,\% de BoVW, y con IVF responde leyendo 117 bloques. BoVW con un codebook
+        pequeño tampoco aprovecha el índice invertido: sus palabras son tan frecuentes
+        que cada consulta lee casi todo el archivo de postings. El índice invertido
+        necesita vocabularios grandes y dispersos.
+  \item \textbf{En texto, lo léxico sigue siendo imprescindible.} Para consultas con
+        nombres propios BM25 supera a SBERT en aciertos y lee 250 veces menos bloques
+        que el k-NN exacto; la semántica aporta en paráfrasis y entre idiomas. Por eso
+        el RAG muestra ambas rutas lado a lado y permite fusionarlas.
   \item \textbf{La aplicación de IA no necesitó estructuras fuera del motor.} Corpus,
         embeddings, codebook e imágenes indexadas son tablas e índices consultables con
         el mismo SQL del cliente web, y el modelo de lenguaje solo consume los
