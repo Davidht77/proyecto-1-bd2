@@ -73,21 +73,27 @@ if filas:
     ax.legend(fontsize=8)
     guardar(fig, "exp7_precision")
 
-    fig, axes = plt.subplots(1, 3, figsize=(8.6, 3.0))
+    # barras horizontales: las etiquetas de los 7 metodos no caben bajo el eje x
+    cortas = [etiqueta7(r).replace(chr(10), " ") for r in filas]
+    fig, axes = plt.subplots(1, 3, figsize=(9.0, 3.0), sharey=True)
     series = [
-        ("extract_ms_per_image", "Extracción por imagen (ms)"),
-        ("avg_query_ms", "Latencia de consulta (ms)"),
-        ("avg_reads", "Bloques leídos por consulta"),
+        ("extract_ms_per_image", "Extracción por imagen (ms)", False),
+        ("avg_query_ms", "Latencia de consulta (ms, log)", True),
+        ("avg_reads", "Bloques leídos por consulta (log)", True),
     ]
-    for ax, (campo, titulo) in zip(axes, series):
+    ypos = list(range(len(cortas)))[::-1]
+    for ax, (campo, titulo, log) in zip(axes, series):
         ys = [float(r[campo]) for r in filas]
         colores = [COLORES[0] if r["method"] == "bovw" else COLORES[1] for r in filas]
-        ax.bar(xs, ys, color=colores, width=0.6)
+        ax.barh(ypos, ys, color=colores, height=0.6)
         ax.set_title(titulo, fontsize=9)
-        ax.set_xticks(range(len(xs)), xs, fontsize=6.5, rotation=0)
-        ax.grid(axis="x", visible=False)
-        if max(ys) / max(1e-9, min(y for y in ys if y > 0)) > 30:
-            ax.set_yscale("log")
+        if log:
+            ax.set_xscale("log")
+        ax.grid(axis="y", visible=False)
+        for y, v in zip(ypos, ys):
+            ax.annotate(f"{v:,.0f}" if v >= 100 else f"{v:.1f}", (v, y), textcoords="offset points",
+                        xytext=(3, -3), fontsize=7)
+    axes[0].set_yticks(ypos, cortas, fontsize=8)
     guardar(fig, "exp7_costos")
 
 # ---------------------------------------------------------------- Exp 7b
@@ -127,19 +133,20 @@ if filas:
     ax1.set_xticks(probes, [str(p) for p in probes])
     ax1.set_xlabel("probes (celdas sondeadas)")
     ax1.set_ylabel("Recall@10 (%)", color=COLORES[0])
-    ax1.set_ylim(0, 105)
+    ax1.set_ylim(0, 112)
     ax2 = ax1.twinx()
     ax2.plot(probes, [float(r["avg_reads"]) for r in ivf], marker="s", color=COLORES[1], label="bloques leídos")
     ax2.axhline(float(exacto["avg_reads"]), color=COLORES[1], linestyle="--", linewidth=1)
     ax2.annotate(f"k-NN exacto: {float(exacto['avg_reads']):.0f} bloques, {float(exacto['avg_ms']):.0f} ms",
-                 (probes[0], float(exacto["avg_reads"])), textcoords="offset points", xytext=(4, -12), fontsize=7.5)
+                 (probes[-1], float(exacto["avg_reads"])), textcoords="offset points", xytext=(-14, -40),
+                 fontsize=7.5, ha="right", color=COLORES[1])
     ax2.set_yscale("log")
     ax2.set_ylabel("Bloques leídos por consulta (log)", color=COLORES[1])
     ax2.grid(False)
     ax2.spines["right"].set_visible(True)
     for p, r in zip(probes, ivf):
         ax1.annotate(f"{float(r['avg_ms']):.0f} ms", (p, 100 * float(r["recall_at_10"])), textcoords="offset points",
-                     xytext=(0, -14), fontsize=7, ha="center")
+                     xytext=(0, 7), fontsize=7, ha="center")
     guardar(fig, "exp8_recall")
 
 filas = leer("exp8_hibrido.csv")

@@ -65,8 +65,29 @@ executor = Executor(catalog)
 rag = RagService(catalog, executor)
 multimedia = MultimediaStore(catalog, executor, DATASETS_DIR)
 
+def _precargar_modelos() -> None:
+    """Carga SBERT y ResNet-18 en segundo plano si ya hay corpus/tienda.
+
+    Sin esto la primera consulta de la demo paga ~1 minuto de carga del modelo.
+    """
+    import threading
+
+    def tarea():
+        try:
+            if rag.corpus.is_ready():
+                rag.embedder.embed_one("warmup")
+            if multimedia.is_ready():
+                multimedia._embedder._load()
+        except Exception:  # noqa: BLE001 - la precarga es una optimizacion
+            pass
+
+    threading.Thread(target=tarea, daemon=True).start()
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    if os.environ.get("BD2_WARMUP", "1") == "1":
+        _precargar_modelos()
     yield
     catalog.close_all()  # vuelca las paginas sucias del buffer pool a disco
 

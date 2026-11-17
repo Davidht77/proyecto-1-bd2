@@ -152,7 +152,37 @@ CNN), la latencia de consulta y los bloques leídos del índice y de la tabla. E
 \caption{Costo de cada método: extracción por imagen, latencia de consulta y bloques leídos (escala logarítmica donde la diferencia lo exige).}
 \end{figure}
 
-%%ANALISIS7A%%
+\paragraph{Calidad.} Los embeddings densos dominan: ResNet-18 alcanza una
+Precision@10 de 85,9\,\% con búsqueda exacta, mientras que BoVW se queda entre
+8,8\,\% ($K=128$) y 16,5\,\% ($K=512$). BoVW no es ruido ---el azar daría 1,9\,\% para
+estas consultas--- y mejora de forma monótona con $K$, como predice la teoría: un
+vocabulario más fino separa descriptores que un codebook pequeño colapsa en la misma
+palabra. Pero el histograma de palabras locales descarta la geometría y la semántica
+de la escena, que es justamente lo que una red entrenada en ImageNet captura. El IVF
+no cuesta calidad aquí: con una sola celda la precisión es 85,7\,\%, prácticamente la
+del k-NN exacto, porque los vecinos de una imagen de la misma categoría caen en la
+misma región de Voronoi.
+
+\paragraph{Costo de extracción.} Medidos sobre la misma muestra de 300 imágenes y sin
+otra carga en la máquina, SIFT con cuantización cuesta unos 12\,ms por imagen y
+ResNet-18 unos 17\,ms en lotes de 32 en CPU. La diferencia es menor de lo que suele
+suponerse porque la CNN aprovecha el procesamiento por lotes y SIFT no; con GPU la
+relación se invertiría.
+
+\paragraph{Costo de consulta e I/O.} Aquí aparece el resultado menos intuitivo. La
+consulta BoVW lee unas 3\,000 páginas y tarda alrededor de 1\,s, más que el propio
+k-NN exacto sobre ResNet (8\,677 páginas, 359\,ms) en latencia y no muy lejos en I/O.
+La causa es estructural: con $K\le 512$ casi todas las palabras visuales aparecen en
+casi todas las imágenes, así que su $df$ es alto, su idf es cercano a cero y sus listas
+de posteo son largas (1,2 millones de postings repartidos entre 256 palabras, unas 19
+páginas por lista). Una imagen de consulta trae unas 160 palabras distintas y el índice
+termina leyendo casi todo el archivo de postings. El índice invertido rinde cuando el
+vocabulario es grande y disperso ---como el de texto, con 88\,728 términos para el
+corpus de 15\,000 artículos--- y la literatura de recuperación de imágenes usa por
+eso codebooks de $10^4$ a $10^6$ palabras. En cambio, ResNet + IVF con una celda lee
+117 bloques y responde en 6\,ms: 74 veces menos I/O y 60 veces menos latencia que el
+k-NN exacto, con la misma precisión. Sondear más celdas solo suma I/O
+(509 bloques con 5, 1\,880 con 20) sin mejorar la precisión de manera apreciable.
 
 \begin{figure}[H]
 \centering
@@ -160,4 +190,19 @@ CNN), la latencia de consulta y los bloques leídos del índice y de la tabla. E
 \caption{Experimento 7b: aciertos de ítem conocido y bloques leídos por consulta, léxico frente a SBERT.}
 \end{figure}
 
-%%ANALISIS7B%%
+\paragraph{Texto.} En la búsqueda de ítem conocido el resultado se invierte:
+la recuperación léxica es la mejor y la más barata. BM25 pone el artículo correcto en
+primer lugar en el 84,7\,\% de las consultas y dentro del top-10 en el 96,7\,\%,
+leyendo 16 bloques en 1,5\,ms; TF-IDF con coseno empata en el top-10 (96,3\,\%) y cae
+en el primer puesto (77,3\,\%) porque no satura la frecuencia ni normaliza por largo
+como BM25. SBERT exacto llega a 89,3\,\% en el top-10 recorriendo los 4\,000 registros
+(158\,ms). La consulta es el título, es decir, exactamente las palabras raras que el
+índice invertido aprovecha y que un embedding de 384 dimensiones diluye. El IVF sobre
+embeddings de texto reales también es más sensible a \code{probes} que en el
+Experimento 8: con una celda el top-10 baja a 54,3\,\% y hace falta sondear 20 celdas
+(674 bloques) para acercarse al exacto. Los embeddings de texto no forman clusters tan
+nítidos como la mezcla de gaussianas sintética, y un título corto queda lejos del
+centroide de su artículo. La consecuencia práctica para el RAG es mostrar las dos
+rutas y permitir fusionarlas: la léxica gana en nombres propios y términos exactos, y
+la semántica recupera fragmentos de otro idioma o con paráfrasis, como se ve en la
+interfaz cuando una pregunta en español trae el artículo ``Black hole''.

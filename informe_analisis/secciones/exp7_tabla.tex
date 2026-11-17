@@ -1,0 +1,36 @@
+\begin{table}[H]
+\centering\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrrrrr}
+\toprule
+Método & P@5 (\%) & P@10 (\%) & extracción (ms/img) & consulta (ms) & bloques & índice / tabla & índice (KB) \\
+\midrule
+BoVW, $K=128$ & 10,8 & 8,8 & 11,9 & 971,1 & 2\,703 & 2\,692 / 11 & 13\,132 \\
+BoVW, $K=256$ & 14,4 & 12,5 & 11,9 & 1\,057,5 & 3\,085 & 3\,074 / 11 & 19\,292 \\
+BoVW, $K=512$ & 19,3 & 16,5 & 11,6 & 964,8 & 2\,928 & 2\,917 / 11 & 25\,240 \\
+ResNet-18, k-NN exacto & 87,1 & 85,9 & 17,2 & 358,6 & 8\,677 & 0 / 8\,677 & 0 \\
+ResNet-18, IVF probes=1 & 86,3 & 85,7 & 17,2 & 6,0 & 117 & 106 / 11 & 35\,088 \\
+ResNet-18, IVF probes=5 & 87,3 & 86,5 & 17,2 & 13,4 & 509 & 498 / 11 & 35\,088 \\
+ResNet-18, IVF probes=20 & 87,2 & 86,0 & 17,2 & 39,2 & 1\,880 & 1\,869 / 11 & 35\,088 \\
+\bottomrule
+\end{tabular}
+\caption{Experimento 7a (\code{exp7\_imagenes.csv}): Caltech-101, 8677 imágenes de 101 categorías, 150 consultas. Precisión = fracción del top-$k$ con la misma categoría que la consulta (sin contar la propia imagen).}
+\label{tab:exp7a}
+\end{table}
+
+\begin{table}[H]
+\centering\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrrrrr}
+\toprule
+Método & hit@1 (\%) & hit@10 (\%) & MRR@10 & consulta$\to$vector (ms) & búsqueda (ms) & bloques & índice / tabla \\
+\midrule
+TF-IDF + coseno & 77,3 & 96,3 & 0,844 & 0,1 & 1,6 & 16 & 9 / 7 \\
+BM25 & 84,7 & 96,7 & 0,892 & 0,1 & 1,5 & 16 & 9 / 7 \\
+SBERT, k-NN exacto & 77,3 & 89,3 & 0,820 & 11,4 & 158,5 & 4\,000 & 0 / 4\,000 \\
+SBERT, IVF probes=1 & 48,3 & 54,3 & 0,507 & 10,3 & 5,8 & 48 & 38 / 10 \\
+SBERT, IVF probes=5 & 68,3 & 77,0 & 0,720 & 10,2 & 9,0 & 191 & 181 / 10 \\
+SBERT, IVF probes=20 & 75,0 & 86,7 & 0,795 & 10,7 & 20,8 & 674 & 664 / 10 \\
+\bottomrule
+\end{tabular}
+\caption{Experimento 7b (\code{exp7\_texto.csv}): Wikipedia es/en, 4000 artículos, 300 consultas de ítem conocido (la consulta es el título; acierto = recuperar ese artículo).}
+\label{tab:exp7b}
+\end{table}

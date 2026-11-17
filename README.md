@@ -261,9 +261,22 @@ python -m backend.benchmarks.experiment7 --text --text-n 4000  # además 7b: TF-
 ```
 
 Escribe `benchmarks/results/exp7_imagenes.csv` (Precision@5/@10, ms de extracción,
-latencia y bloques por método) y `exp7_texto.csv` (hit@1, hit@10, MRR). Informe en
-`informe_analisis/experimento7_multimedia.tex` y figuras con
-`informe_analisis/figuras/generar_p2.py`.
+latencia y bloques por método) y `exp7_texto.csv` (hit@1, hit@10, MRR).
+
+### Informe del Entregable 2
+
+`informe_analisis/informe_p2.tex` es el documento maestro; cada rol edita su archivo en
+`informe_analisis/secciones/` (`espacial`, `textual`, `vectorial`, `multimedia`). Los
+números salen de los CSV:
+
+```bash
+python informe_analisis/figuras/generar_p2.py          # figuras de los Experimentos 7 y 8
+python informe_analisis/secciones/exp7_tabla.py        # tablas del Experimento 7
+python informe_analisis/secciones/sincronizar_espacial.py  # copia el cuerpo de experimento5_rtree.tex
+```
+
+Se compila con `pdflatex informe_p2.tex` desde `informe_analisis/` (o subiendo la
+carpeta a Overleaf). El guion del video está en `tutorial_video_demostrativo_p2.md`.
 
 ### Módulo espacial (R-Tree)
 
