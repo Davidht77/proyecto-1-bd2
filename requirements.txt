@@ -18,5 +18,8 @@ sentence-transformers>=3    # SBERT multilingue (384-D) para el RAG
 requests>=2.31              # descarga de Caltech-101 (verifica certificados)
 anthropic>=0.40             # cliente LLM (opcional: solo si se usa ANTHROPIC_API_KEY)
 
+# Experimento 6: comparacion con el indice GIN de PostgreSQL (solo el benchmark)
+psycopg2-binary>=2.9
+
 # Informe (figuras)
 matplotlib>=3.8

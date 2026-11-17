@@ -142,8 +142,8 @@ export default function RagPanel() {
           <div><dt>documentos</dt><dd>{listo ? status.n_docs.toLocaleString('es') : '—'}</dd></div>
           <div><dt>páginas de la tabla</dt><dd>{listo ? status.table_pages.toLocaleString('es') : '—'}</dd></div>
           <div><dt>celdas IVF</dt><dd>{listo ? status.dense_index.n_lists : '—'}</dd></div>
-          <div><dt>vocabulario</dt><dd>{listo ? bytes(status.inverted_bytes?.['spimi.vocab.btree.dat']) : '—'}</dd></div>
-          <div><dt>postings</dt><dd>{listo ? bytes(status.inverted_bytes?.['spimi.post']) : '—'}</dd></div>
+          <div><dt>vocabulario</dt><dd>{listo ? bytes(status.inverted_bytes?.['vocab.dic']) : '—'}</dd></div>
+          <div><dt>postings</dt><dd>{listo ? bytes(status.inverted_bytes?.['postings.inv']) : '—'}</dd></div>
           <div>
             <dt>LLM</dt>
             <dd title={status?.llm?.model}>{status?.llm ? `${status.llm.provider} · ${status.llm.model}` : '—'}</dd>

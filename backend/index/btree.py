@@ -47,6 +47,7 @@ class BPlusTree:
         page_size: int = 4096,
         cache_size: int = 0,
         counter: DiskCounter | None = None,
+        file_suffix: str = ".btree.dat",
     ):
         self.base_path = base_path
         self.key_column = key_column
@@ -70,7 +71,7 @@ class BPlusTree:
         # indice leyendo su columna 0 con peek_header(), sin guardar el tipo
         # de la clave en ningun metadato externo.
         self.pager = Pager(
-            f"{base_path}.btree.dat",
+            f"{base_path}{file_suffix}",
             record_size=self.node_schema.record_size,
             schema=self.node_schema,
             page_size=page_size,

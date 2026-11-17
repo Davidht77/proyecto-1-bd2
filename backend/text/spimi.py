@@ -6,10 +6,20 @@ ordena por termino y se vuelca a un archivo de bloque; la RAM nunca guarda mas
 de `budget` postings. Cada bloque es una secuencia de (termino, page, slot, tf, dl).
 
 Fase 2, merge_blocks: merge k-vias de los bloques con un heap, leyendo una
-pagina por bloque a la vez. Por cada termino sale una sola lista en
-`<base>.spimi.post` (listas seguidas, sin hojas vacias) y una entrada en el
-vocabulario, un B+ con termino -> RID(posicion inicial de la lista, df). N y la suma de los largos
-quedan en user_a / user_b del archivo de postings, para el avgdl de BM25.
+pagina por bloque a la vez. El resultado son los dos archivos binarios del
+enunciado (5.2):
+
+    <base>.vocab.dic     diccionario: B+ paginado con termino -> (offset, df).
+                         `offset` es la posicion inicial de la lista en
+                         postings.inv y, como cada documento aparece una sola
+                         vez por termino, el largo de la lista es df.
+    <base>.postings.inv  listas de posteo <page, slot, tf, dl> ordenadas por
+                         RID (doc_id), una detras de otra, en paginas de 4 KB.
+                         Una consulta lee solo las paginas [offset, offset+df)
+                         de los terminos pedidos (seek al offset, sin escaneo).
+
+N y la suma de los largos quedan en user_a / user_b de postings.inv, para el
+avgdl de BM25.
 """
 
 import heapq
@@ -24,6 +34,9 @@ from backend.storage.disk_counter import DiskCounter
 from backend.storage.schema import Column, ColumnType, Schema
 from backend.text.postings import POSTING, PostingsFile
 from backend.text.preprocess import MAX_TERM_BYTES, preprocess
+
+VOCAB_SUFFIX = ".vocab.dic"        # diccionario (enunciado 5.2)
+POSTINGS_SUFFIX = ".postings.inv"  # listas de posteo (enunciado 5.2)
 
 BLOCK = Schema([Column("term", ColumnType.CHAR, MAX_TERM_BYTES), *POSTING.columns])
 
@@ -63,9 +76,9 @@ def invert_blocks(docs: Iterable[tuple[int, int, str]], base: str, budget: int =
 
 def open_index(base: str, page_size: int = 4096, cache_size: int = 0,
                counter: DiskCounter | None = None) -> tuple[BPlusTree, PostingsFile]:
-    vocab = BPlusTree(f"{base}.spimi.vocab", BLOCK.columns[0], page_size=page_size,
-                      cache_size=cache_size, counter=counter)
-    post = PostingsFile(f"{base}.spimi.post", page_size=page_size, cache_size=cache_size, counter=counter)
+    vocab = BPlusTree(base, BLOCK.columns[0], page_size=page_size,
+                      cache_size=cache_size, counter=counter, file_suffix=VOCAB_SUFFIX)
+    post = PostingsFile(f"{base}{POSTINGS_SUFFIX}", page_size=page_size, cache_size=cache_size, counter=counter)
     return vocab, post
 
 

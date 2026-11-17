@@ -54,6 +54,7 @@ from backend.engine.parser import (
     SpatialKNN,
     SpatialRadius,
     Statement,
+    TextMatch,
     parse,
 )
 from backend.index import geo
@@ -61,6 +62,8 @@ from backend.index.hash import RID as HashRID
 from backend.index.rtree import RTreeRID
 from backend.storage.page import page_capacity
 from backend.storage.schema import ColumnType, Schema, parse_vector
+from backend.text.boolean import BooleanQueryError
+from backend.text.inverted import SCORE_FUNCTION, InvertedIndex, decode_rid, scan_match
 from backend.vector.ivf import IVFIndex, VRID
 from backend.vector.knn import knn_linear
 
@@ -128,6 +131,7 @@ MAX_ROWS = 500  # el visor de resultados pagina; no tiene sentido enviar 500k fi
 DEFAULT_SETTINGS: dict[str, Any] = {
     "ivf.probes": 4,             # listas que escanea el IVF por consulta
     "hybrid.strategy": "AUTO",   # AUTO | PRE | POST (forzar para experimentos)
+    "vector.scan": "AUTO",       # AUTO | EXACT (EXACT ignora el IVF: k-NN exacto con la misma metrica)
 }
 
 # Orden de preferencia entre rutas de acceso cuando hay varios predicados.
@@ -201,14 +205,13 @@ class Executor:
     def _create_index(self, stmt: CreateIndex) -> QueryResult:
         if not self.catalog.exists(stmt.table):
             raise TableNotFound(f"la tabla «{stmt.table}» no existe")
-        if stmt.kind not in ("HASH", "BTREE", "IVF", "RTREE"):
-            dueno = {"INVERTED": "el módulo textual (índice invertido)",
-                     "HNSW": "una segunda estructura ANN (se implementó IVF)"}.get(stmt.kind, "")
+        if stmt.kind not in ("HASH", "BTREE", "IVF", "RTREE", "INVERTED"):
+            dueno = {"HNSW": "una segunda estructura ANN (se implementó IVF)"}.get(stmt.kind, "")
             raise NotImplementedFeature(
                 f"CREATE INDEX ... USING {stmt.kind} todavía no está conectado al motor"
                 + (f": corresponde a {dueno}." if dueno else ".")
             )
-        if stmt.options and stmt.kind != "IVF":
+        if stmt.options and stmt.kind not in ("IVF", "INVERTED"):
             raise SQLRuntimeError(f"USING {stmt.kind} no acepta opciones WITH (...)")
         _validar_columna(self.catalog.open_table(stmt.table).schema, stmt.column, stmt.table)
         self.catalog.create_index(stmt.table, stmt.name, stmt.column, stmt.kind, stmt.options)
@@ -219,6 +222,14 @@ class Executor:
                 f"{stmt.table}.{stmt.column}: {st['n_vectors']} vectores de dimensión "
                 f"{st['dim']} en {st['n_lists']} celdas de Voronoi, {st['list_pages']} "
                 f"páginas de listas ({st['records_per_page']} vectores por página)."
+            )
+        elif stmt.kind == "INVERTED":
+            st = self.catalog.open_index(stmt.table, stmt.name).stats()
+            mensaje = (
+                f"Índice «{stmt.name}» creado (INVERTED, {st['scoring']}) sobre "
+                f"{stmt.table}.{stmt.column}: {st['n_docs']} documentos, {st['postings']} postings "
+                f"en {st['postings_pages']} páginas, vocabulario B+ de {st['vocab_pages']} páginas "
+                f"y {st['norm_pages']} páginas de normas ({st['size_bytes']:,} bytes)."
             )
         elif stmt.kind == "RTREE":
             tree = self.catalog.open_index(stmt.table, stmt.name)
@@ -256,6 +267,10 @@ class Executor:
             valor = str(valor).upper()
             if valor not in ("AUTO", "PRE", "POST"):
                 raise SQLRuntimeError("hybrid.strategy debe ser AUTO, PRE o POST")
+        elif stmt.name == "vector.scan":
+            valor = str(valor).upper()
+            if valor not in ("AUTO", "EXACT"):
+                raise SQLRuntimeError("vector.scan debe ser AUTO o EXACT")
         self.settings[stmt.name] = valor
         return _ok(Plan("SET", None, f"{stmt.name} = {valor}"), message=f"{stmt.name} = {valor}")
 
@@ -282,6 +297,7 @@ class Executor:
         overflow_antes = sf.n_overflow if es_seq else 0
         rid = sf.insert(tuple(valores))
         self._index_on_insert(stmt.table, sf.schema, valores, rid)
+        self.catalog.invalidate_inverted(stmt.table)
         sf.flush()
         # La reorganizacion automatica vacia el overflow; es la senal fiable de
         # que se reescribio el area principal.
@@ -386,6 +402,8 @@ class Executor:
                     idx.flush()
         sf.flush()
         self._rebuild_rtree_indexes(stmt.table)
+        if borradas:
+            self.catalog.invalidate_inverted(stmt.table)
 
         return _ok(
             plan,
@@ -485,13 +503,15 @@ class Executor:
 
         if stmt.special:
             pred = stmt.special[0]
+            if len(stmt.special) > 1:
+                raise NotImplementedFeature(
+                    "combinar MATCH y WITHIN_RADIUS/KNN en la misma consulta todavía no está "
+                    "soportado: usa uno de los dos junto a filtros relacionales o vectoriales"
+                )
             if isinstance(pred, (SpatialRadius, SpatialKNN)):
                 return self._select_spatial(stmt, sf, pred, max_rows)
-            modulo = "el módulo textual (índice invertido + COSINE_SCORE)"
-            raise NotImplementedFeature(
-                f"El predicado MATCH ya se parsea, pero su ejecución corresponde a "
-                f"{modulo}, que aún no está conectado al planificador."
-            )
+            if isinstance(pred, TextMatch):
+                return self._select_text(stmt, sf, pred, max_rows)
         if any(isinstance(c, ScoreExpr) for c in stmt.columns):
             raise SQLRuntimeError("COSINE_SCORE()/BM25_SCORE() solo tienen sentido junto a un predicado MATCH")
         for f in stmt.filters:
@@ -539,6 +559,182 @@ class Executor:
             exec_ms=0.0,
             truncated=total > len(filas),
         )
+
+    # ------------------------------------------------------- consultas textuales
+
+    def _inverted_for(self, table: str, column: str) -> dict | None:
+        return next((i for i in self.catalog.indexes_of(table)
+                     if i["kind"] == "INVERTED" and i["column"].lower() == column.lower()), None)
+
+    def _select_text(self, stmt: Select, sf, pred: TextMatch, max_rows: int) -> QueryResult:
+        """MATCH (enunciado 5.2 y 5.4): filter-and-refine con el indice invertido.
+
+        Filtro: el indice resuelve el MATCH (booleano o de ranking) leyendo solo
+        el vocabulario y las listas de las palabras de la consulta, y da el
+        score de cada documento sin tocar la tabla. Refinamiento: se leen las
+        filas candidatas por RID, en orden de relevancia, se aplican los demas
+        predicados del WHERE y, si hay un LIMIT sobre el score, se para al
+        juntar k. Si ademas se ordena por una distancia vectorial, los
+        candidatos del texto alimentan un k-NN exacto (pre-filtrado textual).
+        Sin indice invertido: Full Text Scan sobre la tabla.
+        """
+        schema, table = sf.schema, stmt.table
+        _validar_columna(schema, pred.column, table)
+        tcol = next(i for i, c in enumerate(schema.columns) if c.name.lower() == pred.column.lower())
+        if schema.columns[tcol].type is not ColumnType.CHAR:
+            raise SQLRuntimeError(f"MATCH solo aplica a columnas de texto; «{schema.columns[tcol].name}» es "
+                                  f"{schema.columns[tcol].type.name}")
+        for f in stmt.filters:
+            _validar_columna(schema, f.column, table)
+
+        funciones = {c.function for c in stmt.columns if isinstance(c, ScoreExpr)}
+        if len(funciones) > 1:
+            raise SQLRuntimeError("usa una sola función de score por consulta (COSINE_SCORE() o BM25_SCORE())")
+        info = self._inverted_for(table, pred.column)
+        scoring = (SCORE_FUNCTION[next(iter(funciones))] if funciones
+                   else info["scoring"] if info else "TFIDF_COSINE")
+
+        # Orden: por score (por defecto), por una columna o por una distancia vectorial.
+        etiquetas_score = {c.label.lower() for c in stmt.columns if isinstance(c, ScoreExpr)}
+        etiquetas_score |= {"cosine_score()", "bm25_score()", "score"}
+        ok = stmt.order_by
+        orden_score = None  # None | "DESC" | "ASC"
+        orden_columna = None
+        if stmt.distance is None:
+            if ok is None:
+                orden_score = "DESC"
+            elif isinstance(ok.key, str) and ok.key.lower() in etiquetas_score:
+                orden_score = "DESC" if ok.descending else "ASC"
+            else:
+                orden_columna = self._order_column(schema, stmt)
+
+        io = self._io_snapshot(sf, table)
+        reconstruido = False
+        filas_tabla: list = []
+        try:
+            if info is not None:
+                idx: InvertedIndex = self.catalog.open_index(table, info["name"])
+                if idx.stale:
+                    self.catalog.rebuild_inverted(table, info["name"])
+                    reconstruido = True
+                res = idx.match(pred.query, scoring)
+            else:
+                filas_tabla = list(self._rows_for(sf, None, self._plan(sf, table, None, "Select"), None,
+                                                  table=table))
+                res = scan_match(enumerate(r[tcol] for r in filas_tabla), pred.query, scoring)
+        except BooleanQueryError as exc:
+            raise SQLRuntimeError(f"consulta MATCH: {exc}") from None
+
+        texto = {"column": schema.columns[tcol].name, "query": pred.query, "mode": res.mode,
+                 "scoring": res.scoring, "terms": res.terms, "matches": len(res.rids)}
+        if info is not None:
+            texto.update(index=info["name"], lists_read=res.lists_read, postings_read=res.postings_read)
+        if reconstruido:
+            texto["rebuilt"] = "el índice estaba desactualizado (INSERT/DELETE previo) y se reconstruyó"
+
+        def fila(rid):
+            if info is None:
+                return filas_tabla[rid]
+            page_id, slot, area = decode_rid(*rid)
+            return self.catalog.row_at(table, HashRID(page_id, slot, area))
+
+        orden = res.ranked()
+        if orden_score == "ASC":
+            orden = orden[::-1]
+        elif orden_score is None:
+            orden = [(r, res.scores.get(r, 0.0)) for r in res.rids]
+
+        # Refinamiento: filas candidatas + predicados relacionales.
+        corte = stmt.limit if (orden_score == "DESC" and stmt.distance is None) else None
+        aceptadas: list[tuple[float, tuple]] = []
+        leidas = 0
+        for rid, score in orden:
+            if corte is not None and len(aceptadas) >= corte:
+                break
+            row = fila(rid)
+            leidas += 1
+            if row is None or not all(_matches(schema, row, f) for f in stmt.filters):
+                continue
+            aceptadas.append((score, row))
+        texto["rows_fetched"] = leidas
+
+        detalle = {"text": texto, "engine": self.catalog.engine_of(table)}
+        if stmt.filters:
+            detalle["residual_filters"] = [f.column for f in stmt.filters]
+        fuente = (f"el índice invertido «{info['name']}»" if info else
+                  "un Full Text Scan (no hay índice invertido sobre la columna)")
+
+        if stmt.distance is not None:
+            return self._text_then_vector(stmt, sf, aceptadas, detalle, fuente, io, max_rows)
+
+        if orden_columna is not None:
+            c, desc = orden_columna
+            aceptadas.sort(key=lambda e: e[1][c], reverse=desc)
+            detalle["sort"] = f"{schema.columns[c].name} {'DESC' if desc else 'ASC'} (en memoria)"
+        elif orden_score is not None:
+            detalle["sort"] = f"score {orden_score}"
+        if stmt.limit is not None:
+            aceptadas = aceptadas[: stmt.limit]
+
+        modo = "booleana" if res.mode == "boolean" else "de ranking (OR de las palabras)"
+        plan = Plan(
+            "InvertedIndexScan" if info else "TextSeqScan", table,
+            f"MATCH {modo} resuelto con {fuente}: {len(res.rids)} documentos cumplen; "
+            f"se leyeron {leidas} filas de la tabla"
+            + (f" y se aplicaron los filtros sobre {', '.join(detalle['residual_filters'])}" if stmt.filters else "")
+            + f". Ranking {res.scoring}.",
+            detail=detalle,
+        )
+        items, columnas = _text_projection(schema, stmt.columns, table)
+        filas = [[round(score, 6) if it == "__score__" else _jsonable(row[it]) for it in items]
+                 for score, row in aceptadas[:max_rows]]
+        reads, writes = self._io_finish(io, plan)
+        return QueryResult(columns=columnas, rows=filas, row_count=len(aceptadas), plan=plan,
+                           disk_reads=reads, disk_writes=writes, parse_ms=0.0, exec_ms=0.0,
+                           truncated=len(aceptadas) > len(filas))
+
+    def _text_then_vector(self, stmt, sf, aceptadas, detalle, fuente, io, max_rows) -> QueryResult:
+        """MATCH + ORDER BY distancia: el texto filtra y el k-NN exacto ordena."""
+        schema, dist = sf.schema, stmt.distance
+        _validar_columna(schema, dist.column, stmt.table)
+        vcol = next(i for i, c in enumerate(schema.columns) if c.name.lower() == dist.column.lower())
+        if schema.columns[vcol].type is not ColumnType.VECTOR:
+            raise SQLRuntimeError(
+                f"«{schema.columns[vcol].name}» no es una columna VECTOR: no admite {dist.operator}")
+        try:
+            q = np.asarray(parse_vector(dist.vector, schema.columns[vcol].length), dtype=np.float32)
+        except ValueError as exc:
+            raise SQLRuntimeError(f"vector de consulta: {exc}") from None
+        ok = stmt.order_by
+        if ok is not None and not (isinstance(ok.key, DistanceExpr)
+                                   or ok.key.lower() in {(dist.alias or "").lower(), dist.label.lower()}):
+            raise SQLRuntimeError("con una distancia vectorial el ORDER BY debe ser la distancia (o su alias)")
+        filas = [row for _, row in aceptadas]
+        scores = {id(row): s for s, row in aceptadas}
+        if stmt.limit is not None and (ok is None or not ok.descending):
+            res = knn_linear(filas, lambda r: r[vcol], q, dist.metric, stmt.limit)
+        else:
+            from backend.vector.distance import distances
+            d = distances(q, np.asarray([r[vcol] for r in filas], dtype=np.float32), dist.metric) if filas else []
+            res = sorted(zip([float(x) for x in d], filas), key=lambda e: e[0],
+                         reverse=bool(ok and ok.descending))
+            if stmt.limit is not None:
+                res = res[: stmt.limit]
+        detalle["vector"] = {"metric": dist.metric, "k": stmt.limit, "column": schema.columns[vcol].name,
+                             "candidates": len(filas)}
+        plan = Plan("TextPreFilter", stmt.table,
+                    f"Pre-filtrado textual: {fuente} entrega {len(filas)} filas que cumplen el MATCH y "
+                    f"los demás predicados; sobre ellas se calcula la distancia {dist.metric} exacta "
+                    f"y se conservan las {stmt.limit or len(filas)} mejores.", detail=detalle)
+        items, columnas = _text_projection(schema, stmt.columns, stmt.table, dist)
+        out = []
+        for d, row in res[:max_rows]:
+            out.append([round(d, 6) if it == "__dist__" else round(scores[id(row)], 6) if it == "__score__"
+                        else _jsonable(row[it]) for it in items])
+        reads, writes = self._io_finish(io, plan)
+        return QueryResult(columns=columnas, rows=out, row_count=len(res), plan=plan,
+                           disk_reads=reads, disk_writes=writes, parse_ms=0.0, exec_ms=0.0,
+                           truncated=len(res) > len(out))
 
     def _select_spatial(self, stmt: Select, sf, pred, max_rows: int) -> QueryResult:
         """Plan y ejecución de WITHIN_RADIUS y KNN (enunciado 5.1).
@@ -809,13 +1005,16 @@ class Executor:
         es_knn = por_distancia and not ok.descending and stmt.limit is not None
 
         items, columnas = _vector_projection(schema, stmt.columns, dist, stmt.table)
-        ivf = self._ivf_for(stmt.table, col.name, dist.metric)
+        exacto = self.settings["vector.scan"] == "EXACT"
+        ivf = None if exacto else self._ivf_for(stmt.table, col.name, dist.metric)
         io = self._io_snapshot(sf, stmt.table)
 
         if es_knn:
             plan, resultados = self._knn(stmt, sf, vcol, q, dist, ivf)
         else:
             plan, resultados = self._vector_full(stmt, sf, vcol, q, dist, por_distancia)
+        if exacto:
+            plan.detail["forced"] = "SET vector.scan = EXACT: se ignora el IVF"
 
         filas = []
         for d, row in resultados[:max_rows]:
@@ -1230,6 +1429,29 @@ def _vector_projection(schema: Schema, columns: list, dist: DistanceExpr, tabla:
         i = next(i for i, n in enumerate(nombres) if n.lower() == col.lower())
         items.append(i)
         etiquetas.append(nombres[i])
+    return items, etiquetas
+
+
+def _text_projection(schema: Schema, columns: list, tabla: str, dist: DistanceExpr | None = None):
+    """Proyeccion de una consulta MATCH: columnas, '__score__' y '__dist__'.
+    SELECT * agrega el score (y la distancia, si la hay) al final."""
+    nombres = [c.name for c in schema.columns]
+    if not columns:
+        extra = (["__dist__"], [dist.label]) if dist is not None else ([], [])
+        return (list(range(len(nombres))) + ["__score__"] + extra[0], nombres + ["score"] + extra[1])
+    items, etiquetas = [], []
+    for col in columns:
+        if isinstance(col, ScoreExpr):
+            items.append("__score__")
+            etiquetas.append(col.label)
+        elif isinstance(col, DistanceExpr):
+            items.append("__dist__")
+            etiquetas.append(col.label)
+        else:
+            _validar_columna(schema, col, tabla)
+            i = next(i for i, n in enumerate(nombres) if n.lower() == col.lower())
+            items.append(i)
+            etiquetas.append(nombres[i])
     return items, etiquetas
 
 

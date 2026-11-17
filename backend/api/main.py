@@ -265,6 +265,7 @@ def reorganize(table: str) -> dict:
         for info in [i for i in catalog.indexes_of(table) if i["kind"] == "RTREE"]:
             catalog.drop_index(table, info["name"])
             catalog.create_index(table, info["name"], info["column"], "RTREE")
+        catalog.invalidate_inverted(table)
         return {
             "table": table,
             "before": antes,
@@ -534,7 +535,7 @@ async def multimedia_search(
     return {"query": origen, **r}
 
 
-# ------------------------------------------------- endpoints declarados, pendientes
+# ------------------------------------------------- benchmarks e inspeccion de indices
 
 
 @app.post("/api/benchmarks/run")

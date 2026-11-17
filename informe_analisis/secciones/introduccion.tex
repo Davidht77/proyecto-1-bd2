@@ -31,29 +31,31 @@ módulos nuevos:
 
 \begin{figure}[H]
 \centering
+\resizebox{\textwidth}{!}{%
 \begin{tikzpicture}[
   node distance=4mm and 6mm,
   caja/.style={draw, rounded corners=1pt, align=center, font=\small, inner sep=4pt, minimum height=8mm},
   capa/.style={draw, dashed, rounded corners=2pt, inner sep=5pt},
   flecha/.style={-{Latex[length=2mm]}, thick},
 ]
-\node[caja, fill=blue!6] (web) {Cliente web (React)\\ SQL · mapa Leaflet · RAG · multimedia};
-\node[caja, fill=blue!6, below=of web] (api) {API REST (FastAPI)\\ \code{/api/query} · \code{/api/rag/*} · \code{/api/multimedia/*}};
-\node[caja, below=of api] (exec) {Parser SQL multimodal + planificador híbrido\\ \code{SeqScan} · \code{IndexScan} · \code{SpatialSeqScan}/R-Tree · \code{KnnSeqScan} · \code{IVFScan} · \code{PreFilter}/\code{PostFilter}};
+\node[caja, fill=blue!6] (web) {Cliente web (React)\\ SQL $\cdot$ mapa Leaflet $\cdot$ RAG $\cdot$ multimedia};
+\node[caja, fill=blue!6, below=of web] (api) {API REST (FastAPI)\\ \code{/api/query} $\cdot$ \code{/api/rag/*} $\cdot$ \code{/api/multimedia/*}};
+\node[caja, below=of api] (exec) {Parser SQL multimodal + planificador híbrido\\ \code{SeqScan} $\cdot$ \code{IndexScan} $\cdot$ \code{SpatialSeqScan}/R-Tree $\cdot$ \code{KnnSeqScan} $\cdot$ \code{IVFScan} $\cdot$ \code{PreFilter}/\code{PostFilter}};
 \node[caja, below left=6mm and -22mm of exec, fill=green!6] (rt) {R-Tree\\ \code{.rtree.dat}};
-\node[caja, right=of rt, fill=green!6] (inv) {Índice invertido\\ \code{vocab} B+ · \code{postings} · \code{norms}};
-\node[caja, right=of inv, fill=green!6] (ivf) {IVF\\ \code{.ivf.dir} · \code{.ivf.lst}};
-\node[caja, right=of ivf, fill=green!6] (rel) {B+ · Hash\\ (Proyecto 1)};
+\node[caja, right=of rt, fill=green!6] (inv) {Índice invertido\\ \code{vocab.dic} $\cdot$ \code{postings.inv} $\cdot$ \code{norms}};
+\node[caja, right=of inv, fill=green!6] (ivf) {IVF\\ \code{.ivf.dir} $\cdot$ \code{.ivf.lst}};
+\node[caja, right=of ivf, fill=green!6] (rel) {B+ $\cdot$ Hash\\ (Proyecto 1)};
 \node[caja, below=8mm of inv, xshift=14mm, fill=orange!8] (pager) {\code{Pager} + \code{DiskCounter} + \code{Page} (bloques de 4 KB, RID $\langle$page, slot$\rangle$)};
-\node[caja, below=of pager] (disk) {Heap File · Sequential File · archivos de índice};
-\node[caja, left=10mm of rt, fill=red!5, text width=30mm] (ia) {Modelos de IA\\ SIFT+K-Means · ResNet-18\\ SBERT · LLM};
+\node[caja, below=of pager] (disk) {Heap File $\cdot$ Sequential File $\cdot$ archivos de índice};
+\node[caja, left=10mm of rt, fill=red!5, text width=30mm] (ia) {Modelos de IA\\ SIFT+K-Means $\cdot$ ResNet-18\\ SBERT $\cdot$ LLM};
 \draw[flecha] (web) -- (api);
 \draw[flecha] (api) -- (exec);
 \foreach \n in {rt,inv,ivf,rel} \draw[flecha] (exec) -- (\n);
 \foreach \n in {rt,inv,ivf,rel} \draw[flecha] (\n) -- (pager);
 \draw[flecha] (pager) -- (disk);
 \draw[flecha, dashed] (ia) |- (api);
-\end{tikzpicture}
+\end{tikzpicture}%
+}
 \caption{Arquitectura del Entregable 2. Los modelos de IA solo producen vectores o
 texto; todo lo que se persiste y se consulta pasa por el motor y su contador de I/O.}
 \end{figure}

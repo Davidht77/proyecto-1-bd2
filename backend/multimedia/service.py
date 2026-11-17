@@ -5,11 +5,11 @@ Todo lo persistente vive en el motor del proyecto:
     imagenes       (id INT PK, categoria CHAR(20), archivo CHAR(64), emb VECTOR(512)) USING HEAP
     idx_emb        IVF COSINE sobre imagenes.emb                       (paradigma moderno)
     codebook_bovw  (id INT PK, centro VECTOR(128)) USING HEAP          (palabras visuales)
-    <text_dir>/imagenes__bovw.*   vocabulario B+ + postings + normas   (paradigma clasico)
+    <text_dir>/imagenes__bovw.*   vocab.dic + postings.inv + normas   (paradigma clasico)
 
-El indice BoVW se guarda en un subdirectorio (`data/text/`) porque el catalogo
-descubre los indices relacionales por el nombre de archivo en `data/` y un
-`.btree.dat` de vocabulario no debe aparecer como un B+ de la tabla.
+El indice BoVW se guarda en un subdirectorio (`data/text/`) para separar los
+archivos del modulo textual (`vocab.dic`, `postings.inv`, `norms.dat`) de las
+tablas e indices relacionales que el catalogo descubre por nombre en `data/`.
 
 Extraccion de caracteristicas (`extract_features`): una pasada de SIFT sobre
 una muestra para entrenar el/los codebooks y una segunda pasada completa que
@@ -308,11 +308,13 @@ class MultimediaStore:
             ex.execute(f"SET ivf.probes = {int(probes)}")
         sql = (f"SELECT id, categoria, archivo, emb <=> '{_vec(vec)}' AS dist FROM {TABLE} "
                f"ORDER BY dist ASC LIMIT {int(k)}")
-        if exact:
-            # sin indice utilizable el planificador cae a KnnSeqScan: se fuerza
-            # consultando con la metrica L2, para la que no hay IVF
-            sql = sql.replace("<=>", "<->")
-        r = ex.execute(sql)
+        # exact: SET vector.scan = 'EXACT' hace que el planificador ignore el IVF y
+        # resuelva el k-NN exacto (KnnSeqScan) con la misma metrica coseno.
+        ex.execute(f"SET vector.scan = '{'EXACT' if exact else 'AUTO'}'")
+        try:
+            r = ex.execute(sql)
+        finally:
+            ex.execute("SET vector.scan = 'AUTO'")
         return {
             "hits": [{"id": row[0], "categoria": row[1], "archivo": row[2], "score": row[3]} for row in r.rows],
             "metrics": _metrics(r),

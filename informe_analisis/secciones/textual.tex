@@ -1,12 +1,6 @@
 \section{Módulo textual: índice invertido en disco}
 \label{sec:textual}
 
-% ---------------------------------------------------------------------------
-% ROL 2: esta sección es tuya. Lo que sigue describe lo que ya existe en
-% backend/text/ y deja marcados los huecos del Experimento 6. Sustituye o amplía
-% libremente; las otras secciones referencian \ref{sec:textual}.
-% ---------------------------------------------------------------------------
-
 \subsection{Pipeline léxico y SPIMI}
 
 El preprocesamiento (\code{backend/text/preprocess.py}) tokeniza con una expresión
@@ -18,35 +12,231 @@ se corta a 24 bytes porque el vocabulario lo guarda en un \code{CHAR} de ancho f
 La construcción es SPIMI (\code{spimi.py}): una pasada sobre los documentos acumula
 término $\to$ postings en RAM hasta un presupuesto de postings, vuelca cada bloque
 ordenado a disco y al final hace un merge de $k$ vías con un heap, leyendo una
-página por bloque. El resultado son dos archivos paginados:
+página por bloque. Como el merge es estable y la tabla se recorre en orden de RID,
+cada lista de posteo queda ordenada por RID sin reordenarla.
 
-\begin{itemize}[nosep]
-  \item \textbf{vocabulario} (\code{<base>.spimi.vocab.btree.dat}): un árbol B+ del
-        Proyecto 1 con clave \code{CHAR(24)} y valor
-        $\langle$posición inicial de la lista, $df_t\rangle$;
-  \item \textbf{postings} (\code{<base>.spimi.post}): un único arreglo contiguo de
-        registros $\langle$page, slot, $tf_{t,d}$, $|d|\rangle$ de 16 bytes
-        (252 por página), con las listas una detrás de otra y ordenadas por RID.
-\end{itemize}
+\subsection{Diseño en disco}
 
-$N$ y la suma de largos de documento viven en la cabecera del archivo de postings
-(\code{user\_a}/\code{user\_b}) para el \code{avgdl} de BM25. El módulo multimedia
-(sección~\ref{sec:multimedia}) añade un tercer archivo con la norma euclidiana de cada
-documento para el \code{CosineScore} del enunciado.
+Un índice \code{INVERTED} sobre la columna de una tabla son cuatro archivos paginados
+por el \code{Pager}:
 
-\subsection{Recuperación}
+\begin{table}[H]
+\centering\small
+\begin{tabularx}{\textwidth}{lY}
+\toprule
+Archivo & Contenido \\
+\midrule
+\code{<t>\_\_<idx>.inv.meta} & cabecera autodescriptiva: la columna indexada, el ranking por defecto (\code{user\_a}) y si el índice quedó desactualizado (\code{user\_b}) \\
+\code{...inv.vocab.dic} & diccionario: un árbol B+ del Proyecto~1 con clave \code{CHAR(24)} (el término $t$) y valor $\langle$offset de la lista en \code{postings.inv}, $df_t\rangle$; como cada documento aparece una vez por término, el largo de la lista de posteo es $df_t$ \\
+\code{...inv.postings.inv} & listas de posteo: un arreglo contiguo de registros $\langle$page, slot, $tf_{t,d}$, $|d|\rangle$ de 16 bytes (252 por página), con las listas una detrás de otra y ordenadas por RID; $N$ y $\sum|d|$ van en la cabecera \\
+\code{...inv.norms.dat} & la norma euclidiana $\|\vec d\|_2$ de cada documento, precalculada para el coseno \\
+\bottomrule
+\end{tabularx}
+\caption{Archivos del índice invertido.}
+\end{table}
 
-\code{ranking.py} implementa BM25 top-$k$ leyendo solo las listas de los términos de la
-consulta y conservando los mejores $k$ en un heap. \code{multimedia/tfidf.py} implementa
-sobre los mismos archivos el TF-IDF logarítmico con similitud de coseno. Las consultas
-booleanas (\code{AND}, \code{OR}, \code{AND-NOT}) con mezcla de dos punteros y la conexión
-de \code{MATCH} al planificador corresponden al Rol 2.
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  pg/.style={draw, rounded corners=1pt, minimum width=1.5cm, minimum height=0.85cm,
+             font=\scriptsize, align=center},
+  >={Stealth[length=2mm]}, node distance=0.22cm]
+  \node[font=\footnotesize\bfseries, anchor=west] at (-0.8,3.1) {\texttt{vocab.dic} (B+): término $\to$ (offset, $df$)};
+  \node[pg, fill=blue!10] (r) at (3.2,2.35) {raíz};
+  \node[pg, fill=blue!6] (h1) at (0.6,1.4) {hoja\\\texttt{guerr}: (812, 37)};
+  \node[pg, fill=blue!6, right=of h1] (h2) {hoja\\\texttt{histori}: (849, 61)};
+  \node[right=of h2] (hd) {$\cdots$};
+  \draw[->] (r) -- (h1.north);
+  \draw[->] (r) -- (h2.north);
+  \draw[->, dashed] (h1) -- (h2);
 
-\subsection{Experimento 6: índice invertido vs. full scan vs. GIN}
+  \node[font=\footnotesize\bfseries, anchor=west] at (-0.8,-1.2) {\texttt{postings.inv}: un arreglo contiguo, listas ordenadas por RID};
+  \node[pg, fill=gray!15] (p0) at (0,-0.4) {pág.\ 0\\$N$, $\sum|d|$};
+  \node[pg, fill=orange!18, right=of p0] (p1) {pág.\ 1};
+  \node[right=of p1] (pd) {$\cdots$};
+  \node[pg, fill=orange!18, right=of pd] (p4) {pág.\ 4\\pos.\ 812..};
+  \node[pg, fill=orange!18, right=of p4] (p5) {pág.\ 4--5\\pos.\ 849..};
+  \draw[->, blue!60!black] (h1.south) .. controls +(0,-0.7) and +(0,0.7) .. (p4.north);
+  \draw[->, blue!60!black] (h2.south) .. controls +(0,-0.7) and +(0,0.7) .. (p5.north);
+\end{tikzpicture}
+\caption{Diseño físico del índice invertido. Ubicar un término cuesta la altura del B+;
+leer su lista cuesta las páginas que ocupa ($\lceil df/252\rceil$, a veces una más si la
+lista cruza un borde de página). Las listas van seguidas porque la mayoría de los términos
+aparece en un solo documento: darle a cada lista su propia página desperdiciaría casi todo
+el archivo.}
+\label{fig:inv-disco}
+\end{figure}
 
-% TODO (Rol 2): tiempo de construcción y tamaño (vocab + postings) escalando de
-% 1 000 a 20 000 documentos; latencia y bloques de AND / OR / AND-NOT y top-k para
-% consultas de 1, 3 y 5 términos frente a full text scan y GIN (to_tsvector) de
-% PostgreSQL. El corpus de 15 000 artículos de Wikipedia está en
-% data/datasets/wiki_15k.csv (python -m backend.rag.download).
-\emph{Pendiente de incorporar por el Rol 2.}
+El RID de cada posting es el $\langle$page, slot$\rangle$ de la fila. En el Sequential
+File el área de overflow se marca con un bit alto de \code{page}, de modo que el orden de
+los RID coincide con el del recorrido de la tabla (área principal y luego overflow) y las
+mezclas booleanas siguen funcionando.
+
+\subsection{Recuperación booleana y ranking}
+
+\paragraph{Consultas booleanas en $O(n+m)$.} \code{backend/text/boolean.py} implementa la
+intersección (\code{AND}), la unión (\code{OR}) y la diferencia (\code{AND-NOT}) con la
+mezcla de dos punteros sobre listas ordenadas: cada lista se recorre una sola vez. La
+consulta se parsea con la precedencia usual (\code{NOT} > \code{AND} > \code{OR}),
+paréntesis y \code{AND} implícito entre palabras seguidas. Un \code{AND} intersecta primero
+de la lista más corta a la más larga, para que el resultado intermedio nunca crezca, y
+recién después resta las listas negadas. Un \code{NOT} necesita un término positivo al lado
+(\code{a AND NOT b}): el complemento de una lista no se puede recorrer en el índice. Una
+palabra que es stopword no filtra.
+
+\paragraph{Ranking.} Sobre los mismos archivos conviven dos funciones de score. TF-IDF con
+similitud de coseno, como pide el enunciado:
+\[
+w_{t,d} = (1+\log_{10} tf_{t,d})\cdot\log_{10}\frac{N}{df_t}
+\qquad
+\text{score}(q,d)=\frac{\sum_{t\in q} w_{t,q}\,w_{t,d}}{\|\vec q\|_2\,\|\vec d\|_2}
+\]
+y BM25, que el enunciado admite como alternativa. Solo se leen las listas de los términos
+de la consulta; los productos parciales se acumulan en un diccionario y el top-$k$ sale de
+un heap. Cada lista se lee una vez aunque el término participe a la vez del filtro booleano
+y del score.
+
+\subsection{Integración con SQL}
+
+\begin{lstlisting}
+CREATE INDEX idx_texto ON documentos (texto) USING INVERTED WITH (scoring = 'TFIDF_COSINE');
+SELECT id, titulo, COSINE_SCORE() AS relevancia FROM documentos
+WHERE texto MATCH 'aprendizaje AND profundo AND NOT basico' AND anio >= 2010
+ORDER BY relevancia DESC LIMIT 10;
+\end{lstlisting}
+
+Una consulta con operadores (\code{AND}, \code{OR}, \code{NOT}, paréntesis) es booleana: el
+resultado son los documentos que la cumplen, ordenados por relevancia. Sin operadores es
+una consulta de ranking: las palabras se combinan con \code{OR} y el orden lo da el score.
+\code{COSINE\_SCORE()} y \code{BM25\_SCORE()} eligen la función de score de la consulta; sin
+ellas se usa la del índice (\code{WITH (scoring = ...)}).
+
+El executor resuelve \code{MATCH} con un esquema de filtro y refinamiento
+(\code{InvertedIndexScan}). El índice entrega los documentos que cumplen y su score leyendo
+solo el vocabulario y las listas de la consulta, sin tocar la tabla. Después se leen las
+filas candidatas por RID en orden de relevancia, se aplican los demás predicados del
+\code{WHERE} y, con un \code{LIMIT} sobre el score, la lectura para al juntar $k$ filas. Sin
+índice invertido la misma consulta se resuelve con un Full Text Scan (\code{TextSeqScan})
+que lee toda la tabla y preprocesa cada documento; las dos rutas devuelven exactamente el
+mismo resultado, que es lo que verifican los tests. Si además la consulta se ordena por una
+distancia vectorial, los candidatos del texto alimentan un k-NN exacto
+(\code{TextPreFilter}): texto, predicados relacionales y similitud vectorial en una sola
+consulta. El plan reporta el modo, los términos, las listas y postings leídos, las filas
+traídas de la tabla y el I/O del índice y de la tabla por separado.
+
+\paragraph{Mantenimiento.} SPIMI construye el índice de una vez. Un \code{INSERT}, un
+\code{DELETE} o una reorganización solo lo marcan como desactualizado (escribir la cabecera
+cuesta una página) y la siguiente consulta \code{MATCH} lo reconstruye antes de usarlo; el
+plan lo indica y el costo aparece como escrituras del índice. Es el modelo de reindexación
+por lotes de los motores de búsqueda: mantener listas comprimidas y contiguas en cada
+inserción obligaría a reescribirlas.
+
+\subsection{Experimento 6: índice invertido vs.\ Full Text Scan vs.\ GIN}
+
+\paragraph{Metodología.} Corpus de 20\,000 artículos de Wikipedia (10\,000 en español y
+10\,000 en inglés, los primeros 1000 bytes de cada uno), descargados con
+\code{backend/rag/download.py}. Todo corre por SQL a través del executor
+(\code{backend/benchmarks/experiment6.py}), con páginas de 4\,KB y sin buffer pool. La
+referencia externa es PostgreSQL~16 en un contenedor, con una columna
+\code{tsvector} generada con el diccionario del idioma de cada documento y un índice GIN
+sobre ella; su I/O se mide con \code{EXPLAIN (ANALYZE, BUFFERS)} (bloques compartidos leídos
+o encontrados en caché, de 8\,KB). Las consultas salen del propio corpus: las palabras de
+un \code{AND} se toman de un mismo documento, para que el resultado no quede vacío, y la
+palabra negada de un \code{AND-NOT} es una palabra frecuente que ese documento no tiene. Se
+usaron 20 consultas por celda para el índice y GIN y 2 para el Full Text Scan, cuya
+latencia casi no varía entre consultas.
+
+\paragraph{Construcción.}
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{rrrrrr}
+\toprule
+Documentos & \multicolumn{2}{c}{Índice invertido} & \multicolumn{2}{c}{GIN (PostgreSQL)} & Escrituras \\
+ & tiempo (s) & tamaño (MB) & tiempo (s) & tamaño (MB) & del índice \\
+\midrule
+1\,000 & 10,3 & 1,9 & 0,06 & 1,1 & 14\,618 \\
+2\,500 & 24,5 & 4,2 & 0,12 & 2,3 & 27\,303 \\
+5\,000 & 45,8 & 7,6 & 0,24 & 3,9 & 44\,008 \\
+10\,000 & 84,6 & 13,8 & 0,52 & 6,4 & 68\,813 \\
+20\,000 & 167,9 & 27,8 & 1,11 & 13,5 & 140\,340 \\
+\bottomrule
+\end{tabular}
+\caption{Experimento 6a (\code{exp6\_construccion.csv}): construcción del índice invertido (vocabulario + postings + normas) y del GIN.}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{exp6_construccion}
+\caption{Tiempo de construcción y tamaño en disco al crecer el corpus (escala log-log). Las dos estructuras crecen linealmente con el número de documentos.}
+\end{figure}
+
+Los dos índices crecen linealmente: el nuestro cuesta unos 8,4\,ms y 1,4\,KB por documento
+y el GIN 0,06\,ms y 0,7\,KB. La diferencia de tamaño es de diseño: nuestros postings son
+registros fijos de 16 bytes sin comprimir que guardan además $tf$ y $|d|$ (los necesita el
+ranking sin tocar la tabla), el vocabulario usa claves \code{CHAR(24)} de ancho fijo y hay
+un archivo de normas; el GIN comprime las listas (deltas codificados en bytes variables) y
+no guarda frecuencias. La diferencia de tiempo (150 veces) viene de que el vocabulario se
+arma insertando término por término en el B+ del Proyecto~1 desde Python (140\,340
+escrituras de bloque para 20\,000 documentos), mientras que PostgreSQL ordena en memoria y
+construye el árbol de abajo hacia arriba en C.
+
+\paragraph{Consultas.}
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{rlrrrrrrr}
+\toprule
+ & & \multicolumn{2}{c}{Índice invertido} & \multicolumn{2}{c}{GIN} & \multicolumn{2}{c}{Full Text Scan} & \\
+Términos & Operación & ms & bloques & ms & bloques & ms & bloques & coinciden \\
+\midrule
+1 & AND (un término) & 72,3 & 256 & 0,3 & 203 & 40\,207 & 5000 & 250 \\
+1 & Top-10 & 8,3 & 22 & 16,3 & 3\,094 & 40\,207 & 5000 & 606 \\
+3 & AND & 7,4 & 32 & 0,1 & 21 & 40\,361 & 5000 & 2 \\
+3 & AND-NOT & 17,5 & 71 & 0,1 & 42 & 40\,792 & 5000 & 40 \\
+3 & OR & 61,3 & 252 & 0,2 & 219 & 40\,684 & 5000 & 229 \\
+3 & Top-10 & 12,1 & 39 & 85,0 & 14\,525 & 41\,788 & 5000 & 1\,588 \\
+5 & AND & 9,7 & 48 & 0,1 & 32 & 40\,742 & 5000 & 1 \\
+5 & AND-NOT & 10,8 & 51 & 0,1 & 35 & 40\,478 & 5000 & 4 \\
+5 & OR & 136,1 & 577 & 10,8 & 2\,212 & 40\,569 & 5000 & 539 \\
+5 & Top-10 & 16,4 & 55 & 160,0 & 23\,220 & 40\,801 & 5000 & 2\,380 \\
+\bottomrule
+\end{tabular}
+\caption{Experimento 6b (\code{exp6\_consultas.csv}), $N=20\,000$: latencia y bloques por consulta. ``Coinciden'' es el promedio de documentos que cumplen el \code{MATCH} con el índice. Bloques de 4\,KB en nuestro motor y de 8\,KB en PostgreSQL.}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{exp6_consultas}
+\caption{Latencia y bloques por consulta (escala logarítmica) de las tres rutas.}
+\end{figure}
+
+\paragraph{Análisis.} El Full Text Scan cuesta lo mismo para cualquier consulta: lee las
+5000 páginas de la tabla y vuelve a preprocesar los 20\,000 documentos (tokenizar, quitar
+stopwords, aplicar el stemmer y calcular normas), unos 40 segundos. El índice resuelve las
+mismas consultas entre 300 y 5\,500 veces más rápido y con 9 a 230 veces menos bloques. La
+parte que lee el índice en sí es pequeña (de 7 a 47 bloques: la altura del B+ más las
+páginas de las listas de la consulta); el resto son las filas del resultado traídas de la
+tabla, una por documento, porque el \code{SELECT} pide columnas de la tabla. Por eso en
+las consultas booleanas los bloques crecen con el número de documentos que cumplen (un
+\code{OR} de 5 términos trae 539 filas) y quedan muy cerca de los del GIN, que también
+debe visitar el heap por cada fila.
+
+En las consultas de ranking Top-10 el índice gana a GIN en bloques (de 22 a 55 frente a
+3\,094 a 23\,220) y en tiempo (de 8 a 16\,ms frente a 16 a 160\,ms). El score sale entero de
+los postings ($tf$ y $|d|$) y de las normas, sin tocar la tabla, así que solo se leen las
+10 filas del resultado. \code{ts\_rank} de PostgreSQL, en cambio, necesita el
+\code{tsvector} de cada documento que cumple, que vive en el heap: su costo crece con los
+1\,588 o 2\,380 documentos que coinciden y no con $k$. Guardar $tf$ y $|d|$ en cada posting
+cuesta el doble de espacio que el GIN, y esta es la consulta donde se recupera.
+
+En las consultas booleanas el GIN es mucho más rápido (menos de 1\,ms frente a 7 a 136\,ms)
+con un número parecido de bloques. Esa diferencia no es de I/O sino de implementación: C
+contra Python, y el buffer pool de PostgreSQL contra nuestro motor sin caché, donde cada
+acceso cuenta como lectura a propósito para que el \code{DiskCounter} mida la estructura y
+no la caché.
+
+Los resultados coinciden: para cada consulta el índice y el Full Text Scan devolvieron
+exactamente los mismos documentos (el script lo verifica), y con GIN el número de
+documentos difiere en menos de 1\,\%, por las pequeñas diferencias entre sus listas de
+stopwords y diccionarios y los nuestros.
