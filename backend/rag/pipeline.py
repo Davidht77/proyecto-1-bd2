@@ -39,7 +39,10 @@ def _vec(v) -> str:
 def build_prompt(question: str, hits: list[dict]) -> str:
     partes = [f"[{i}] ({h['lang']}) {h['titulo']}: {h['texto']}" for i, h in enumerate(hits, 1)]
     return ("Fragmentos recuperados:\n\n" + "\n\n".join(partes)
-            + f"\n\nPregunta: {question}\n\nRespuesta (con citas [n]):")
+            + f"\n\nPregunta: {question}\n\n"
+            "Responde en el mismo idioma en que esta escrita la pregunta, aunque los "
+            "fragmentos esten en otro idioma. Cita cada fuente por separado, asi: [1][2].\n\n"
+            "Respuesta:")
 
 
 class RagService:
