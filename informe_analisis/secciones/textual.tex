@@ -1,0 +1,52 @@
+\section{Módulo textual: índice invertido en disco}
+\label{sec:textual}
+
+% ---------------------------------------------------------------------------
+% ROL 2: esta sección es tuya. Lo que sigue describe lo que ya existe en
+% backend/text/ y deja marcados los huecos del Experimento 6. Sustituye o amplía
+% libremente; las otras secciones referencian \ref{sec:textual}.
+% ---------------------------------------------------------------------------
+
+\subsection{Pipeline léxico y SPIMI}
+
+El preprocesamiento (\code{backend/text/preprocess.py}) tokeniza con una expresión
+regular de letras Unicode, pasa a minúsculas, elimina las stopwords de NLTK en
+español e inglés y aplica el stemmer Snowball del idioma detectado (el que más
+stopwords aporta al documento; la consulta pasa por los dos stemmers). Cada término
+se corta a 24 bytes porque el vocabulario lo guarda en un \code{CHAR} de ancho fijo.
+
+La construcción es SPIMI (\code{spimi.py}): una pasada sobre los documentos acumula
+término $\to$ postings en RAM hasta un presupuesto de postings, vuelca cada bloque
+ordenado a disco y al final hace un merge de $k$ vías con un heap, leyendo una
+página por bloque. El resultado son dos archivos paginados:
+
+\begin{itemize}[nosep]
+  \item \textbf{vocabulario} (\code{<base>.spimi.vocab.btree.dat}): un árbol B+ del
+        Proyecto 1 con clave \code{CHAR(24)} y valor
+        $\langle$posición inicial de la lista, $df_t\rangle$;
+  \item \textbf{postings} (\code{<base>.spimi.post}): un único arreglo contiguo de
+        registros $\langle$page, slot, $tf_{t,d}$, $|d|\rangle$ de 16 bytes
+        (252 por página), con las listas una detrás de otra y ordenadas por RID.
+\end{itemize}
+
+$N$ y la suma de largos de documento viven en la cabecera del archivo de postings
+(\code{user\_a}/\code{user\_b}) para el \code{avgdl} de BM25. El módulo multimedia
+(sección~\ref{sec:multimedia}) añade un tercer archivo con la norma euclidiana de cada
+documento para el \code{CosineScore} del enunciado.
+
+\subsection{Recuperación}
+
+\code{ranking.py} implementa BM25 top-$k$ leyendo solo las listas de los términos de la
+consulta y conservando los mejores $k$ en un heap. \code{multimedia/tfidf.py} implementa
+sobre los mismos archivos el TF-IDF logarítmico con similitud de coseno. Las consultas
+booleanas (\code{AND}, \code{OR}, \code{AND-NOT}) con mezcla de dos punteros y la conexión
+de \code{MATCH} al planificador corresponden al Rol 2.
+
+\subsection{Experimento 6: índice invertido vs. full scan vs. GIN}
+
+% TODO (Rol 2): tiempo de construcción y tamaño (vocab + postings) escalando de
+% 1 000 a 20 000 documentos; latencia y bloques de AND / OR / AND-NOT y top-k para
+% consultas de 1, 3 y 5 términos frente a full text scan y GIN (to_tsvector) de
+% PostgreSQL. El corpus de 15 000 artículos de Wikipedia está en
+% data/datasets/wiki_15k.csv (python -m backend.rag.download).
+\emph{Pendiente de incorporar por el Rol 2.}

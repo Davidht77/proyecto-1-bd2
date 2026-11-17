@@ -1,9 +1,11 @@
 const BASE = '/api'
 
 async function request(path, options = {}) {
+  const esForm = options.body instanceof FormData
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
     ...options,
+    // con FormData el navegador fija el Content-Type (incluye el boundary)
+    headers: esForm ? options.headers : { 'Content-Type': 'application/json', ...(options.headers ?? {}) },
   })
   const body = await res.json().catch(() => null)
   if (!res.ok) {
@@ -33,4 +35,22 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
+
+  // ---- aplicacion de IA (RAG) y modulo multimedia (Rol 4)
+  ragStatus: () => request('/rag/status'),
+  ragBuild: (body = {}) => request('/rag/build', { method: 'POST', body: JSON.stringify(body) }),
+  ragAsk: (body) => request('/rag/ask', { method: 'POST', body: JSON.stringify(body) }),
+  mmStatus: () => request('/multimedia/status'),
+  mmBuild: (body = {}) => request('/multimedia/build', { method: 'POST', body: JSON.stringify(body) }),
+  mmSamples: (n = 12, seed) =>
+    request(`/multimedia/samples?n=${n}${seed != null ? `&seed=${seed}` : ''}`),
+  mmSearch: ({ file, imageId, k = 10, probes = 5 }) => {
+    const form = new FormData()
+    if (file) form.append('file', file)
+    if (imageId != null) form.append('image_id', String(imageId))
+    form.append('k', String(k))
+    form.append('probes', String(probes))
+    return request('/multimedia/search', { method: 'POST', body: form })
+  },
+  imageUrl: (id) => `${BASE}/multimedia/image/${id}`,
 }

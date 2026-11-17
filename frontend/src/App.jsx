@@ -5,6 +5,8 @@ import PlanMetrics from './components/PlanMetrics'
 import ResultsTable from './components/ResultsTable'
 import PageMap from './components/PageMap'
 import MapView from './components/MapView'
+import RagPanel from './components/RagPanel'
+import MultimediaPanel from './components/MultimediaPanel'
 
 const EJEMPLOS = [
   ['crear tabla', "CREATE TABLE empleados (\n  id INT PRIMARY KEY,\n  nombre CHAR(30),\n  dept CHAR(20),\n  salario FLOAT\n) USING SEQUENTIAL"],
@@ -18,6 +20,15 @@ const EJEMPLOS = [
   ['índice R-Tree', 'CREATE INDEX idx_geo ON locales (ubicacion) USING RTREE'],
   ['radio', 'SELECT id, nombre, ubicacion FROM locales WHERE ubicacion WITHIN_RADIUS ((-77.0282, -12.1354), 2.5)'],
   ['k-NN espacial', 'SELECT id, nombre, ubicacion FROM locales WHERE ubicacion KNN ((-77.0282, -12.1354), 10)'],
+  ['k-NN vectorial (IVF)', "SET ivf.probes = 5"],
+  ['imágenes por similitud', "SELECT id, categoria, archivo, emb <=> '[0.01, 0.02, 0.03]' AS dist\nFROM imagenes ORDER BY dist ASC LIMIT 5"],
+  ['híbrida', "SELECT id, titulo, emb <=> '[0.01, 0.02, 0.03]' AS dist\nFROM documentos WHERE lang = 'es' ORDER BY dist ASC LIMIT 5"],
+]
+
+const VISTAS = [
+  ['sql', 'Cliente SQL'],
+  ['rag', 'Aplicación IA · RAG'],
+  ['multimedia', 'Multimedia'],
 ]
 
 const SQL_INICIAL = `CREATE TABLE empleados (
@@ -38,6 +49,7 @@ export default function App() {
   const [loadingPages, setLoadingPages] = useState(false)
   const [busy, setBusy] = useState(false)
   const [tab, setTab] = useState('resultados')
+  const [vista, setVista] = useState('sql')
 
   const refrescar = useCallback(async () => {
     const [t, h] = await Promise.all([api.tables(), api.health()])
@@ -170,8 +182,15 @@ export default function App() {
   return (
     <div className="shell">
       <header className="topbar">
-        <h1>Mini-gestor de bases de datos</h1>
-        <span className="course">CS2042 · Proyecto 1</span>
+        <h1>Mini-gestor de bases de datos multimodal</h1>
+        <span className="course">CS2042 · Proyecto 2</span>
+        <nav className="views" aria-label="Vistas">
+          {VISTAS.map(([v, t]) => (
+            <button key={v} aria-selected={vista === v} onClick={() => setVista(v)}>
+              {t}
+            </button>
+          ))}
+        </nav>
         {health && (
           <div className="facts">
             <span>bloque <b>{health.page_size / 1024} KB</b></span>
@@ -181,7 +200,17 @@ export default function App() {
         )}
       </header>
 
-      <div className="workspace">
+      {vista === 'rag' && (
+        <div className="workspace single">
+          <RagPanel />
+        </div>
+      )}
+      {vista === 'multimedia' && (
+        <div className="workspace single">
+          <MultimediaPanel />
+        </div>
+      )}
+      <div className="workspace" hidden={vista !== 'sql'}>
         <aside className="panel sidebar">
           <header>
             Tablas

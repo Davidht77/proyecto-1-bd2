@@ -1,17 +1,24 @@
-# Proyecto 1 — Gestor de Bases de Datos Multimodal (CS2042)
+# Gestor de Bases de Datos Multimodal (CS2042) — Proyectos 1 y 2
 
-Capa de memoria secundaria y organización **Sequential File**.
+Motor relacional sobre memoria secundaria (Heap, Sequential, B+, Hash) extendido con
+los módulos multimodales del Entregable 2: espacial (R-Tree), textual (índice
+invertido), vectorial (IVF) y la **aplicación de IA** (RAG sobre Wikipedia) con el
+módulo multimedia (BoVW vs. embeddings densos).
 
 ## Levantar el sistema
 
 ```bash
-pip install fastapi uvicorn pydantic pytest snowballstemmer numpy
+pip install -r requirements.txt
 cd frontend && npm install && npm run build && cd ..
 python -m uvicorn backend.api.main:app --port 8000
 ```
 
 Abre <http://127.0.0.1:8000>. FastAPI sirve el bundle de React, así que es un solo
-proceso y una sola URL.
+proceso y una sola URL. La barra superior cambia entre el **Cliente SQL**, la
+**Aplicación IA · RAG** y la vista **Multimedia**.
+
+Para dejar la aplicación de IA lista (datasets, corpus e índices) ver la sección
+[Aplicación de IA y módulo multimedia](#aplicación-de-ia-y-módulo-multimedia-rol-4).
 
 Para desarrollar el frontend con recarga en caliente, en otra terminal:
 `cd frontend && npm run dev` (el dev server proxea `/api` al backend del 8000).
@@ -170,6 +177,94 @@ python -m backend.benchmarks.experiment8 --npy emb.npy    # embeddings reales (N
 Escribe `benchmarks/results/exp8_ann.csv` (Recall@10 / ms / bloques vs `probes`, con el
 k-NN exacto como verdad de campo) y `exp8_hibrido.csv` (PRE vs POST según selectividad).
 
+## Aplicación de IA y módulo multimedia (Rol 4)
+
+Enunciado 5.3.1 (BoVW vs. embeddings densos), 5.5 opción A (RAG) y Experimento 7.
+Código en `backend/multimedia/`, `backend/rag/`, `backend/benchmarks/experiment7.py`
+y los paneles `RagPanel.jsx` / `MultimediaPanel.jsx` del cliente web.
+
+### Datos
+
+```bash
+# corpus del RAG: 7 500 artículos de Wikipedia por idioma (es + en = 15 000),
+# API de filas de Hugging Face, reanudable y con espera ante HTTP 429
+python -m backend.rag.download --n 7500 --out data/datasets/wiki_15k.csv
+
+# imágenes: Caltech-101 (9 145 imágenes, 101 categorías) desde data.caltech.edu
+python -m backend.multimedia.datasets --root data/datasets
+```
+
+### Construir el corpus y la tienda de imágenes
+
+Desde la interfaz (botones **Construir corpus** / **Construir tienda**, con progreso) o
+por consola:
+
+```bash
+python -m backend.rag.corpus --csv data/datasets/wiki_15k.csv        # SBERT + tabla + IVF + índice invertido
+python -m backend.multimedia.service --k 256                          # SIFT + K-Means + ResNet-18 + IVF + índice invertido
+```
+
+Lo que queda en disco, todo dentro del motor:
+
+| Objeto | Dónde | Para qué |
+|---|---|---|
+| `documentos (id, lang, titulo CHAR(80), texto CHAR(1000), emb VECTOR(384))` | `data/documentos.heap.dat` | fragmentos que cita el RAG |
+| `documentos__idx_emb.ivf.*` | `data/` | recuperación semántica (SBERT + IVF COSINE) |
+| `documentos__texto.spimi.vocab.btree.dat` + `.spimi.post` + `.norms.dat` | `data/text/` | recuperación léxica (TF-IDF coseno y BM25 sobre el SPIMI de la Parte 3) |
+| `imagenes (id, categoria, archivo, emb VECTOR(512))` | `data/imagenes.heap.dat` | ResNet-18 de cada imagen |
+| `imagenes__idx_emb.ivf.*` | `data/` | paradigma moderno (IVF COSINE) |
+| `codebook_bovw (id, centro VECTOR(128))` | `data/codebook_bovw.heap.dat` | K palabras visuales (K-Means sobre SIFT) |
+| `imagenes__bovw.spimi.*` + `.norms.dat` | `data/text/` | paradigma clásico: histograma BoVW indexado en el índice invertido |
+
+Los índices textuales viven en `data/text/` porque el catálogo descubre los índices
+relacionales por el nombre del archivo en `data/` y el vocabulario (un B+ de
+términos) no debe aparecer como índice de la tabla. `data/cache/` guarda las
+características ya extraídas (`.npy`) para repetir el Experimento 7 sin volver a pagar
+la CNN; no es almacenamiento del gestor.
+
+### Modelo de lenguaje
+
+El proveedor se elige por variables de entorno; sin ninguna, el RAG sigue funcionando
+en modo **extractivo** (recupera, arma el prompt y cita, pero no genera texto):
+
+| Variable | Proveedor | Modelo por defecto |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | Anthropic (SDK oficial) | `claude-opus-5` |
+| `GEMINI_API_KEY` | Google (endpoint compatible OpenAI) | `gemini-2.5-flash` |
+| `GROQ_API_KEY` / `OPENAI_API_KEY` | Groq / OpenAI | `llama-3.3-70b-versatile` / `gpt-4o-mini` |
+| `LLM_BASE_URL` + `LLM_API_KEY` | cualquier API `/chat/completions` (Ollama, OpenRouter…) | `LLM_MODEL` |
+| `LLM_PROVIDER=local` | `transformers` en CPU | `Qwen/Qwen2.5-1.5B-Instruct` |
+
+`LLM_PROVIDER` fuerza uno y `LLM_MODEL` cambia el modelo.
+
+### API
+
+| Método | Ruta | Qué hace |
+|---|---|---|
+| `GET` | `/api/rag/status` | corpus, tamaños de los índices y proveedor LLM |
+| `POST` | `/api/rag/build` | `{limit?, lists?}` construye el corpus en segundo plano |
+| `POST` | `/api/rag/ask` | `{question, k, mode: semantic/lexical/both, probes, scorer: tfidf/bm25, generate}` |
+| `GET` | `/api/multimedia/status` | tienda de imágenes |
+| `POST` | `/api/multimedia/build` | `{k_words, max_per_category?, lists?}` en segundo plano |
+| `POST` | `/api/multimedia/search` | multipart `file` o `image_id` + `k` + `probes` → top-k por ambos paradigmas |
+| `GET` | `/api/multimedia/samples` · `/image/{id}` | imágenes de consulta y archivos |
+
+Cada respuesta trae, por ruta, la ruta de acceso del planificador (`InvertedIndex`,
+`IVFScan`, `KnnSeqScan`), la latencia y los bloques leídos del **índice** y de la
+**tabla** por separado.
+
+### Experimento 7
+
+```bash
+python -m backend.benchmarks.experiment7                     # imágenes: BoVW K=128/256/512 vs ResNet exacto/IVF
+python -m backend.benchmarks.experiment7 --text --text-n 4000  # además 7b: TF-IDF/BM25 vs SBERT en Wikipedia
+```
+
+Escribe `benchmarks/results/exp7_imagenes.csv` (Precision@5/@10, ms de extracción,
+latencia y bloques por método) y `exp7_texto.csv` (hit@1, hit@10, MRR). Informe en
+`informe_analisis/experimento7_multimedia.tex` y figuras con
+`informe_analisis/figuras/generar_p2.py`.
+
 ### Módulo espacial (R-Tree)
 
 El R-Tree se persiste en `<tabla>__<indice>.rtree.dat` sobre la misma cabecera de
@@ -216,6 +311,13 @@ dimensionalidad para D = 2…128). Las figuras y el informe están en
 en `parser.py`). El executor sigue respondiendo 501 hasta conectar el índice
 invertido. Para hacerlo: registrar el índice en `Catalog.indexes_of()` y
 reemplazar el `NotImplementedFeature` de `Executor._select`.
+
+El RAG y el BoVW ya usan el SPIMI (`backend/text/spimi.py`) tal como está:
+`build_index(..., tokenize=)` acepta un tokenizador alternativo (las palabras
+visuales no pasan por stopwords ni stemming) y `backend/multimedia/tfidf.py`
+agrega el archivo de normas y el CosineScore sobre esos mismos postings. Cuando
+`MATCH` se conecte al planificador, `RagService.retrieve_lexical` puede pasar a
+ejecutarse como SQL sin cambiar el resto del pipeline.
 
 ## Contrato con el resto del equipo
 

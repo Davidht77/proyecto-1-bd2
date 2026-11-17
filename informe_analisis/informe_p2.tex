@@ -1,0 +1,64 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish,es-noshorthands]{babel}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{listings}
+\usepackage{amsmath}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,fit,shapes.misc}
+\usepackage[hidelinks]{hyperref}
+
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcommand{\code}[1]{\texttt{#1}}
+\graphicspath{{figuras/}}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true,
+  breaklines=true,
+  showstringspaces=false,
+  xleftmargin=4pt,
+  xrightmargin=4pt,
+}
+
+\title{Motor de base de datos multimodal en disco\\
+\large Base de Datos II (CS2042) --- Proyecto 2: módulos espacial, textual,
+vectorial y aplicación de IA}
+\author{Sebastian Hernandez Miñano \and David Huette Ospino \and
+Luis Millones Carrasco \and Isaac Gamero del Aguila}
+\date{Noviembre de 2026}
+
+\begin{document}
+\maketitle
+
+\begin{center}
+Repositorio: \url{https://github.com/Davidht77/proyecto-1-bd2}
+\end{center}
+
+% Cada sección vive en su propio archivo para que cada rol edite el suyo sin
+% conflictos. El documento maestro solo fija el preámbulo y el orden.
+%
+%   secciones/introduccion.tex   arquitectura multimodal y reglas comunes  (Rol 4)
+%   secciones/espacial.tex       R-Tree + Experimento 5                     (Rol 1)
+%   secciones/textual.tex        índice invertido + Experimento 6           (Rol 2)
+%   secciones/vectorial.tex      IVF + planificador híbrido + Experimento 8 (Rol 3)
+%   secciones/multimedia.tex     BoVW vs embeddings, RAG + Experimento 7    (Rol 4)
+%   secciones/conclusiones.tex
+
+\input{secciones/introduccion}
+\input{secciones/espacial}
+\input{secciones/textual}
+\input{secciones/vectorial}
+\input{secciones/multimedia}
+\input{secciones/conclusiones}
+
+\end{document}

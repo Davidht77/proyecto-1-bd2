@@ -1,0 +1,84 @@
+\section{Resumen y arquitectura multimodal}
+
+El Entregable 1 dejó un motor relacional que guarda todo en páginas binarias de
+tamaño fijo y cuenta cada transferencia con un \code{DiskCounter}. El Entregable 2 lo
+extiende para indexar y recuperar tres clases de datos no convencionales
+---geometrías, texto libre y vectores de alta dimensión--- y lo usa como base de una
+aplicación de inteligencia artificial completa. Cuatro reglas atraviesan todos los
+módulos nuevos:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Solo el \code{Pager} toca el disco.} Cada índice nuevo (R-Tree,
+        vocabulario B+, postings, directorio y listas del IVF, archivo de normas) es un
+        archivo paginado con la misma cabecera de 32 bytes del Proyecto 1. Por eso el
+        desglose de bloques leídos por consulta sigue siendo exacto y comparable entre
+        módulos.
+  \item \textbf{Archivos autodescriptivos.} La página 0 de cada archivo guarda su
+        esquema; el catálogo reconstruye tablas e índices escaneando el directorio, sin
+        metadatos externos ni serializadores de alto nivel.
+  \item \textbf{Una sola gramática.} El parser SQL del Proyecto 1 se extendió con
+        \code{POINT}, \code{VECTOR(D)}, \code{USING RTREE | INVERTED | IVF},
+        \code{WITHIN\_RADIUS}, \code{KNN}, \code{MATCH}, los operadores \code{<->} /
+        \code{<=>} y \code{SET}. El planificador decide la ruta de acceso y la
+        reporta junto al I/O de índice y de tabla.
+  \item \textbf{Todo lo persistente de la aplicación de IA son tablas e índices del
+        motor.} El corpus del RAG, los embeddings, el codebook de palabras visuales y
+        las imágenes indexadas viven en tablas \code{HEAP} con columnas
+        \code{VECTOR(D)} y en los índices anteriores, no en estructuras paralelas.
+\end{enumerate}
+
+\subsection{Mapa de componentes}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  node distance=4mm and 6mm,
+  caja/.style={draw, rounded corners=1pt, align=center, font=\small, inner sep=4pt, minimum height=8mm},
+  capa/.style={draw, dashed, rounded corners=2pt, inner sep=5pt},
+  flecha/.style={-{Latex[length=2mm]}, thick},
+]
+\node[caja, fill=blue!6] (web) {Cliente web (React)\\ SQL · mapa Leaflet · RAG · multimedia};
+\node[caja, fill=blue!6, below=of web] (api) {API REST (FastAPI)\\ \code{/api/query} · \code{/api/rag/*} · \code{/api/multimedia/*}};
+\node[caja, below=of api] (exec) {Parser SQL multimodal + planificador híbrido\\ \code{SeqScan} · \code{IndexScan} · \code{SpatialSeqScan}/R-Tree · \code{KnnSeqScan} · \code{IVFScan} · \code{PreFilter}/\code{PostFilter}};
+\node[caja, below left=6mm and -22mm of exec, fill=green!6] (rt) {R-Tree\\ \code{.rtree.dat}};
+\node[caja, right=of rt, fill=green!6] (inv) {Índice invertido\\ \code{vocab} B+ · \code{postings} · \code{norms}};
+\node[caja, right=of inv, fill=green!6] (ivf) {IVF\\ \code{.ivf.dir} · \code{.ivf.lst}};
+\node[caja, right=of ivf, fill=green!6] (rel) {B+ · Hash\\ (Proyecto 1)};
+\node[caja, below=8mm of inv, xshift=14mm, fill=orange!8] (pager) {\code{Pager} + \code{DiskCounter} + \code{Page} (bloques de 4 KB, RID $\langle$page, slot$\rangle$)};
+\node[caja, below=of pager] (disk) {Heap File · Sequential File · archivos de índice};
+\node[caja, left=10mm of rt, fill=red!5, text width=30mm] (ia) {Modelos de IA\\ SIFT+K-Means · ResNet-18\\ SBERT · LLM};
+\draw[flecha] (web) -- (api);
+\draw[flecha] (api) -- (exec);
+\foreach \n in {rt,inv,ivf,rel} \draw[flecha] (exec) -- (\n);
+\foreach \n in {rt,inv,ivf,rel} \draw[flecha] (\n) -- (pager);
+\draw[flecha] (pager) -- (disk);
+\draw[flecha, dashed] (ia) |- (api);
+\end{tikzpicture}
+\caption{Arquitectura del Entregable 2. Los modelos de IA solo producen vectores o
+texto; todo lo que se persiste y se consulta pasa por el motor y su contador de I/O.}
+\end{figure}
+
+\subsection{Reparto del trabajo}
+
+\begin{table}[H]
+\centering\small
+\begin{tabularx}{\textwidth}{lY}
+\toprule
+Rol & Entregables \\
+\midrule
+1 --- Espacial & R-Tree en disco (MBR, split cuadrático, rango y k-NN), visor Leaflet, Experimento 5. \\
+2 --- Texto & Preprocesamiento (Snowball es/en), SPIMI, vocabulario B+ + postings, booleano, BM25 / TF-IDF, Experimento 6. \\
+3 --- Vectorial y SQL & \code{VECTOR(D)}, k-NN exacto con Max-Heap, IVF en disco, gramática multimodal, planificador PRE/POST con I/O desglosado, Experimento 8. \\
+4 --- Multimedia e IA & BoVW (SIFT + K-Means + índice invertido con TF-IDF coseno) vs. embeddings densos (ResNet-18, SBERT) + IVF; aplicación RAG sobre Wikipedia con cliente LLM multiproveedor; Experimento 7; README, informe y video. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Condiciones de medición}
+
+Todos los experimentos corren con bloques de 4096 bytes y sin buffer pool
+(\code{BD2\_CACHE\_SIZE=0}), de modo que cada lectura de página es una transferencia
+real y el número de bloques es independiente de la máquina. Las latencias se midieron
+en un portátil con CPU Intel i7-13620H sin GPU, 16 GB de RAM y disco SSD, bajo
+Windows 11 y Python 3.12; por eso el análisis prioriza los bloques leídos y usa la
+latencia como confirmación.

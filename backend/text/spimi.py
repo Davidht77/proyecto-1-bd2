@@ -34,11 +34,18 @@ def _write_block(path: str, block: dict[str, list], page_size: int, counter: Dis
 
 
 def invert_blocks(docs: Iterable[tuple[int, int, str]], base: str, budget: int = 50_000,
-                  page_size: int = 4096, counter: DiskCounter | None = None) -> tuple[list[str], int, int]:
-    """docs = (page, slot, texto) de cada fila. Devuelve (rutas de bloques, N, suma de largos)."""
+                  page_size: int = 4096, counter: DiskCounter | None = None,
+                  tokenize=preprocess) -> tuple[list[str], int, int]:
+    """docs = (page, slot, texto) de cada fila. Devuelve (rutas de bloques, N, suma de largos).
+
+    `tokenize` convierte el texto en la lista de terminos. Por defecto es el
+    pipeline lexico (minusculas, stopwords, stemming); el modulo multimedia pasa
+    otro para indexar "palabras visuales" (BoVW), que no deben pasar por el
+    stemmer ni por la lista de stopwords.
+    """
     paths, block, n, n_docs, total_len = [], {}, 0, 0, 0
     for page, slot, text in docs:
-        terms = preprocess(text)
+        terms = tokenize(text)
         n_docs += 1
         total_len += len(terms)
         for term, tf in Counter(terms).items():
@@ -81,6 +88,7 @@ def merge_blocks(paths: list[str], base: str, n_docs: int, total_len: int,
 
 
 def build_index(docs: Iterable[tuple[int, int, str]], base: str, budget: int = 50_000,
-                page_size: int = 4096, counter: DiskCounter | None = None) -> None:
-    paths, n_docs, total_len = invert_blocks(docs, base, budget, page_size, counter)
+                page_size: int = 4096, counter: DiskCounter | None = None,
+                tokenize=preprocess) -> None:
+    paths, n_docs, total_len = invert_blocks(docs, base, budget, page_size, counter, tokenize)
     merge_blocks(paths, base, n_docs, total_len, page_size, counter)

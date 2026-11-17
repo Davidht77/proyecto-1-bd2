@@ -9,6 +9,16 @@ Endpoints implementados:
     POST   /api/tables/{t}/seed            carga masiva de datos sinteticos
     GET    /api/health                     estado del motor
 
+Aplicacion de IA y modulo multimedia (enunciado 5.3 y 5.5, Rol 4):
+    GET    /api/rag/status                 corpus, indices y proveedor LLM
+    POST   /api/rag/build                  carga el corpus de Wikipedia (en segundo plano)
+    POST   /api/rag/ask                    pregunta -> lexico vs semantico -> LLM con citas
+    GET    /api/multimedia/status          tienda de imagenes (BoVW + ResNet/IVF)
+    POST   /api/multimedia/build           extrae caracteristicas e indexa Caltech-101
+    POST   /api/multimedia/search          imagen (multipart o id) -> top-k por ambos paradigmas
+    GET    /api/multimedia/samples         imagenes del dataset para usar como consulta
+    GET    /api/multimedia/image/{id}      sirve el archivo de una imagen indexada
+
 Endpoints declarados pero pendientes (devuelven 501 con el detalle de que falta):
     POST   /api/benchmarks/run             suite de los 4 experimentos
     GET    /api/tables/{t}/index/{nombre}  inspeccion de un indice B+/Hash
@@ -21,7 +31,7 @@ import random
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,6 +46,8 @@ from backend.engine.errors import (
     TableNotFound,
 )
 from backend.engine.executor import Executor
+from backend.multimedia.service import MultimediaStore
+from backend.rag.pipeline import RagService
 from backend.storage.page import NULL_PAGE
 from backend.storage.schema import ColumnType
 
@@ -43,8 +55,15 @@ DATA_DIR = os.environ.get("BD2_DATA_DIR", "data")
 PAGE_SIZE = int(os.environ.get("BD2_PAGE_SIZE", "4096"))
 CACHE_SIZE = int(os.environ.get("BD2_CACHE_SIZE", "0"))
 
+DATASETS_DIR = os.environ.get("BD2_DATASETS_DIR", str(Path(DATA_DIR) / "datasets"))
+WIKI_CSV = os.environ.get("BD2_WIKI_CSV", str(Path(DATASETS_DIR) / "wiki_15k.csv"))
+
 catalog = Catalog(DATA_DIR, page_size=PAGE_SIZE, cache_size=CACHE_SIZE)
 executor = Executor(catalog)
+# Los dos servicios del Rol 4 comparten el catalogo y el executor: toda su
+# persistencia son tablas e indices del motor y todo su I/O pasa por el Pager.
+rag = RagService(catalog, executor)
+multimedia = MultimediaStore(catalog, executor, DATASETS_DIR)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -83,6 +102,27 @@ class SeedRequest(BaseModel):
         "'insert' usa la ruta insert() normal, que es la que mide el Experimento 1",
     )
     shuffle: bool = Field(True, description="Desordenar las claves antes de cargarlas")
+
+
+class RagBuildRequest(BaseModel):
+    csv_path: str | None = Field(None, description="CSV (lang,id,title,text); por defecto BD2_WIKI_CSV")
+    limit: int | None = Field(None, ge=10, description="Tope de documentos (mitad por idioma); None = todos")
+    lists: int | None = Field(None, ge=1, description="Celdas del IVF; None = floor(sqrt(N))")
+
+
+class RagAskRequest(BaseModel):
+    question: str = Field(..., min_length=1)
+    k: int = Field(5, ge=1, le=20)
+    mode: str = Field("semantic", description="semantic | lexical | both")
+    probes: int = Field(5, ge=1, le=200)
+    scorer: str = Field("tfidf", description="tfidf | bm25 para la ruta lexica")
+    generate: bool = Field(True, description="False: solo recuperacion, sin llamar al LLM")
+
+
+class MultimediaBuildRequest(BaseModel):
+    k_words: int = Field(256, ge=8, le=4096, description="Tamano del codebook BoVW")
+    max_per_category: int | None = Field(None, ge=1, description="Tope de imagenes por categoria")
+    lists: int | None = Field(None, ge=1)
 
 
 class BenchmarkRequest(BaseModel):
@@ -128,7 +168,11 @@ def health() -> dict:
             "hash": True,
             "rtree": True,
             "spatial": True,
+            "ivf": True,
+            "rag": rag.corpus.is_ready(),
+            "multimedia": multimedia.is_ready(),
         },
+        "llm": rag.llm.describe(),
     }
 
 
@@ -333,6 +377,121 @@ def seed(table: str, req: SeedRequest) -> dict:
         raise
     except EngineError as exc:
         raise _http(exc) from exc
+
+
+# ----------------------------------------------------------- aplicacion de IA
+
+
+@app.get("/api/rag/status")
+def rag_status() -> dict:
+    return rag.status()
+
+
+@app.post("/api/rag/build")
+def rag_build(req: RagBuildRequest = RagBuildRequest()) -> dict:
+    """Carga el corpus en segundo plano: SBERT + tabla + IVF + indice invertido.
+
+    Tarda minutos con 15 000 documentos (el embedding en CPU domina). El
+    progreso se consulta en GET /api/rag/status.
+    """
+    if rag.corpus.progress["building"]:
+        raise HTTPException(409, {"error": "ocupado", "detail": "ya hay una construccion en curso"})
+    csv_path = req.csv_path or WIKI_CSV
+    if not Path(csv_path).exists():
+        raise HTTPException(404, {"error": "sin_corpus", "detail":
+                            f"no existe {csv_path}. Descargalo con: python -m backend.rag.download "
+                            f"--n 7500 --out {csv_path}"})
+    rag.invalidate()
+    rag.corpus.build_async(csv_path=csv_path, limit=req.limit, lists=req.lists)
+    return {"started": True, "csv_path": csv_path, "limit": req.limit}
+
+
+@app.post("/api/rag/ask")
+def rag_ask(req: RagAskRequest) -> dict:
+    if not rag.corpus.is_ready():
+        raise HTTPException(409, {"error": "sin_corpus", "detail": "el corpus no esta cargado: POST /api/rag/build"})
+    if req.mode not in ("semantic", "lexical", "both"):
+        raise HTTPException(400, {"error": "modo_invalido", "detail": "mode debe ser semantic, lexical o both"})
+    try:
+        return rag.ask(req.question, k=req.k, mode=req.mode, probes=req.probes,
+                       scorer=req.scorer, generate=req.generate)
+    except EngineError as exc:
+        raise _http(exc) from exc
+    except Exception as exc:  # noqa: BLE001 - p. ej. el proveedor LLM rechazo la llamada
+        raise HTTPException(502, {"error": "llm", "detail": str(exc)}) from exc
+
+
+# --------------------------------------------------------------- multimedia
+
+
+@app.get("/api/multimedia/status")
+def multimedia_status() -> dict:
+    return multimedia.status()
+
+
+@app.post("/api/multimedia/build")
+def multimedia_build(req: MultimediaBuildRequest = MultimediaBuildRequest()) -> dict:
+    """Descarga Caltech-101 si falta, extrae SIFT + ResNet-18 e indexa (segundo plano)."""
+    if multimedia.progress["building"]:
+        raise HTTPException(409, {"error": "ocupado", "detail": "ya hay una construccion en curso"})
+    multimedia.build_async(k_words=req.k_words, max_per_category=req.max_per_category, lists=req.lists)
+    return {"started": True, **req.model_dump()}
+
+
+@app.get("/api/multimedia/samples")
+def multimedia_samples(n: int = Query(12, ge=1, le=60), seed: int | None = None) -> dict:
+    if not multimedia.is_ready():
+        raise HTTPException(409, {"error": "sin_tienda", "detail": "la tienda no esta construida: POST /api/multimedia/build"})
+    return {"samples": multimedia.sample(n, seed)}
+
+
+@app.get("/api/multimedia/image/{image_id}")
+def multimedia_image(image_id: int) -> FileResponse:
+    ruta = multimedia.image_path(image_id) if multimedia.is_ready() else None
+    if ruta is None or not ruta.exists():
+        raise HTTPException(404, {"error": "no_encontrada", "detail": f"no hay imagen con id {image_id}"})
+    return FileResponse(ruta)
+
+
+@app.post("/api/multimedia/search")
+async def multimedia_search(
+    file: UploadFile | None = File(None),
+    image_id: int | None = Form(None),
+    k: int = Form(10),
+    probes: int = Form(5),
+) -> dict:
+    """Consulta por imagen: sube un archivo o indica el id de una imagen indexada.
+
+    Devuelve el top-k de los dos paradigmas (BoVW + indice invertido vs.
+    ResNet-18 + IVF) con el tiempo de extraccion, la latencia y el I/O de cada uno.
+    """
+    if not multimedia.is_ready():
+        raise HTTPException(409, {"error": "sin_tienda", "detail": "la tienda no esta construida: POST /api/multimedia/build"})
+    if file is not None:
+        imagen = await file.read()
+        origen = {"kind": "upload", "filename": file.filename}
+    elif image_id is not None:
+        ruta = multimedia.image_path(image_id)
+        if ruta is None:
+            raise HTTPException(404, {"error": "no_encontrada", "detail": f"no hay imagen con id {image_id}"})
+        imagen = str(ruta)
+        origen = {"kind": "indexed", "id": image_id, "archivo": ruta.name}
+    else:
+        raise HTTPException(400, {"error": "sin_imagen", "detail": "envia `file` o `image_id`"})
+    try:
+        # se pide uno de mas: si la consulta es una imagen indexada, ella misma
+        # sale primera y no cuenta como acierto
+        extra = 1 if origen["kind"] == "indexed" else 0
+        r = multimedia.search_image(imagen, k=max(1, min(k, 50)) + extra, probes=max(1, probes))
+    except ValueError as exc:
+        raise HTTPException(400, {"error": "imagen_invalida", "detail": str(exc)}) from exc
+    except EngineError as exc:
+        raise _http(exc) from exc
+    if extra:
+        r["k"] -= 1
+        for ruta_ in ("bovw", "dense"):
+            r[ruta_]["hits"] = [h for h in r[ruta_]["hits"] if h["id"] != image_id][: r["k"]]
+    return {"query": origen, **r}
 
 
 # ------------------------------------------------- endpoints declarados, pendientes
