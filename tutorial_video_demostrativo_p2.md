@@ -47,11 +47,13 @@ Mostrar la barra superior: **Cliente SQL · Aplicación IA · Multimedia**.
 
 ## 3. Módulo textual (1 min 30 s) — Rol 2
 
-1. Mostrar `data/text/documentos__texto.spimi.vocab.btree.dat` y
-   `...spimi.post` en el hexadecimal: diccionario (B+ de términos de 24 bytes) separado
+1. Mostrar `data/text/documentos__texto.vocab.dic` y
+   `...postings.inv` en el hexadecimal: diccionario (B+ de términos de 24 bytes) separado
    de las listas de posteo (registros ⟨page, slot, tf, dl⟩ de 16 bytes, 252 por página).
-2. Consulta booleana y ranking top-k (`MATCH`, `COSINE_SCORE()` cuando esté conectado;
-   si no, desde la vista **Aplicación IA** con la ruta léxica).
+2. Consulta booleana y ranking top-k en el Cliente SQL: `CREATE INDEX ... USING INVERTED`,
+   `WHERE texto MATCH 'a AND b AND NOT c'` con `COSINE_SCORE()` / `BM25_SCORE()`; el plan
+   muestra `InvertedIndexScan` frente a `TextSeqScan`. También desde la vista
+   **Aplicación IA** con la ruta léxica.
 3. Figura del Experimento 6: construcción y tamaño vs. número de documentos; latencia
    y bloques frente a full scan y GIN de PostgreSQL.
 

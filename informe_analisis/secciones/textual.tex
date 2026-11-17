@@ -27,8 +27,8 @@ por el \code{Pager}:
 Archivo & Contenido \\
 \midrule
 \code{<t>\_\_<idx>.inv.meta} & cabecera autodescriptiva: la columna indexada, el ranking por defecto (\code{user\_a}) y si el índice quedó desactualizado (\code{user\_b}) \\
-\code{...inv.spimi.vocab.btree.dat} & vocabulario: un árbol B+ del Proyecto~1 con clave \code{CHAR(24)} y valor $\langle$inicio de la lista, $df_t\rangle$ \\
-\code{...inv.spimi.post} & postings: un arreglo contiguo de registros $\langle$page, slot, $tf_{t,d}$, $|d|\rangle$ de 16 bytes (252 por página), con las listas una detrás de otra y ordenadas por RID; $N$ y $\sum|d|$ van en la cabecera \\
+\code{...inv.vocab.dic} & diccionario: un árbol B+ del Proyecto~1 con clave \code{CHAR(24)} (el término $t$) y valor $\langle$offset de la lista en \code{postings.inv}, $df_t\rangle$; como cada documento aparece una vez por término, el largo de la lista de posteo es $df_t$ \\
+\code{...inv.postings.inv} & listas de posteo: un arreglo contiguo de registros $\langle$page, slot, $tf_{t,d}$, $|d|\rangle$ de 16 bytes (252 por página), con las listas una detrás de otra y ordenadas por RID; $N$ y $\sum|d|$ van en la cabecera \\
 \code{...inv.norms.dat} & la norma euclidiana $\|\vec d\|_2$ de cada documento, precalculada para el coseno \\
 \bottomrule
 \end{tabularx}
@@ -41,7 +41,7 @@ Archivo & Contenido \\
   pg/.style={draw, rounded corners=1pt, minimum width=1.5cm, minimum height=0.85cm,
              font=\scriptsize, align=center},
   >={Stealth[length=2mm]}, node distance=0.22cm]
-  \node[font=\footnotesize\bfseries, anchor=west] at (-0.8,3.1) {vocabulario (B+): término $\to$ (inicio, $df$)};
+  \node[font=\footnotesize\bfseries, anchor=west] at (-0.8,3.1) {\texttt{vocab.dic} (B+): término $\to$ (offset, $df$)};
   \node[pg, fill=blue!10] (r) at (3.2,2.35) {raíz};
   \node[pg, fill=blue!6] (h1) at (0.6,1.4) {hoja\\\texttt{guerr}: (812, 37)};
   \node[pg, fill=blue!6, right=of h1] (h2) {hoja\\\texttt{histori}: (849, 61)};
@@ -50,7 +50,7 @@ Archivo & Contenido \\
   \draw[->] (r) -- (h2.north);
   \draw[->, dashed] (h1) -- (h2);
 
-  \node[font=\footnotesize\bfseries, anchor=west] at (-0.8,-1.2) {postings: un arreglo contiguo, listas ordenadas por RID};
+  \node[font=\footnotesize\bfseries, anchor=west] at (-0.8,-1.2) {\texttt{postings.inv}: un arreglo contiguo, listas ordenadas por RID};
   \node[pg, fill=gray!15] (p0) at (0,-0.4) {pág.\ 0\\$N$, $\sum|d|$};
   \node[pg, fill=orange!18, right=of p0] (p1) {pág.\ 1};
   \node[right=of p1] (pd) {$\cdots$};

@@ -5,7 +5,15 @@ los módulos multimodales del Entregable 2: espacial (R-Tree), textual (índice
 invertido), vectorial (IVF) y la **aplicación de IA** (RAG sobre Wikipedia) con el
 módulo multimedia (BoVW vs. embeddings densos).
 
-## Levantar el sistema
+## Levantar el sistema (un solo paso)
+
+```bash
+./run.sh          # Linux / macOS / Git Bash
+.\run.ps1         # Windows PowerShell
+```
+
+El script crea `.venv`, instala `requirements.txt`, construye el frontend y levanta la
+API. Requisitos: Python ≥ 3.11 y Node ≥ 18. Equivale a:
 
 ```bash
 pip install -r requirements.txt
@@ -27,6 +35,31 @@ Tests: `python -m pytest -q`
 
 Variables de entorno: `BD2_DATA_DIR` (por defecto `data`), `BD2_PAGE_SIZE` (4096) y
 `BD2_CACHE_SIZE` (0 = sin buffer pool, que es como deben correr los benchmarks).
+
+## Estructura del repositorio
+
+| Carpeta | Contenido |
+|---|---|
+| `backend/` | motor (almacenamiento, archivos, índices, SQL, módulos textual/vectorial/multimedia, RAG) y API REST (FastAPI) |
+| `frontend/` | cliente web React + Vite (SQL, mapa Leaflet, RAG, multimedia) |
+| `data/` | archivos binarios del motor y datasets descargados (ver `data/README.md`) |
+| `benchmarks/results/` | CSV de los Experimentos 1–8; el código está en `backend/benchmarks/` |
+| `informe_analisis/` | informes LaTeX: `informe_analisis.tex` (P1) e `informe_p2.tex` (P2), con sus PDF |
+| `tests/` | `python -m pytest -q` |
+
+## Cobertura del enunciado (Entregable 2)
+
+| Enunciado | Dónde |
+|---|---|
+| 5.1 R-Tree en disco: MBR, split cuadrático, rango/radio, k-NN por `MINDIST`, mapa Leaflet | `backend/index/rtree.py`, `geo.py`, `frontend/src/components/MapView.jsx` |
+| 5.2 Índice invertido: tokenización, stopwords, stemming Snowball, SPIMI, `vocab.dic` + `postings.inv`, booleano AND/OR/AND-NOT en O(n+m), TF-IDF + coseno (normas L2 en disco), BM25 | `backend/text/` |
+| 5.3 BoVW (SIFT + K-Means + TF-IDF sobre el índice invertido), embeddings densos (ResNet-18, SBERT), k-NN exacto con Max-Heap, IVF en disco | `backend/multimedia/`, `backend/vector/` |
+| 5.4 `USING RTREE \| INVERTED \| IVF`, `WITHIN_RADIUS`, `KNN`, `MATCH`, `COSINE_SCORE()`, `<->`, `<=>`, `SET ivf.probes`, planificador PRE/POST con I/O de índice vs tabla | `backend/engine/` |
+| 5.5 Aplicación de IA: RAG (opción A) sobre 15 000 artículos, léxico vs semántico, LLM con fuentes y métricas de I/O | `backend/rag/`, `frontend/src/components/RagPanel.jsx` |
+| 6 Experimentos 5–8 | `backend/benchmarks/experiment{5,6,7,8}.py` → `benchmarks/results/` → `informe_analisis/figuras/generar_p2.py` |
+
+HNSW (opción 2 de 5.3) no se implementó: el enunciado pide al menos una estructura ANN y
+se eligió IVF.
 
 ## SQL soportado
 
@@ -70,8 +103,10 @@ un Hashing Dinámico sobre disco y habilita `IndexScan` en el planificador.
 | `GET` | `/api/tables/{t}/pages` | funcionando — inspección de páginas físicas |
 | `POST` | `/api/tables/{t}/seed` | funcionando — carga de datos sintéticos |
 | `GET` | `/api/health` | funcionando |
-| `POST` | `/api/benchmarks/run` | **501** — necesita B+ (usa Heap/Sequential/Hash mientras tanto) |
-| `GET` | `/api/tables/{t}/index/{n}` | funcionando para `RTREE` (altura, MBR y nodos); 501 para el resto |
+| `POST` | `/api/benchmarks/run` | funcionando — Experimentos 1–5 (`{"experiment": 0}` = todos) |
+| `GET` | `/api/tables/{t}/index/{n}` | funcionando para `RTREE` (altura, MBR y nodos); el resto se inspecciona desde el plan |
+| `GET`/`POST` | `/api/rag/*` | aplicación RAG (estado, construcción, pregunta) |
+| `GET`/`POST` | `/api/multimedia/*` | tienda de imágenes (BoVW vs ResNet-18 + IVF) |
 
 Documentación interactiva en `/docs`.
 
@@ -98,7 +133,7 @@ Documentación interactiva en `/docs`.
 
 | Módulo | Responsabilidad | Estado |
 |---|---|---|
-| `btree.py` | Árbol B+ multinivel en disco | **pendiente** |
+| `btree.py` | Árbol B+ multinivel en disco (split, punto, rango por `next_leaf`) | listo |
 | `hash.py` | Extendible Hashing | listo (sebastian) |
 | `rtree.py` | R-Tree espacial persistido (MBR, split cuadrático, k-NN) | listo |
 | `geo.py` | Haversine, caja de radio y `MINDIST` geográfico | listo |
@@ -227,7 +262,7 @@ Lo que queda en disco, todo dentro del motor:
 |---|---|---|
 | `documentos (id, lang, titulo CHAR(80), texto CHAR(1000), emb VECTOR(384))` | `data/documentos.heap.dat` | fragmentos que cita el RAG |
 | `documentos__idx_emb.ivf.*` | `data/` | recuperación semántica (SBERT + IVF COSINE) |
-| `documentos__texto.spimi.vocab.btree.dat` + `.spimi.post` + `.norms.dat` | `data/text/` | recuperación léxica (TF-IDF coseno y BM25 sobre el SPIMI de la Parte 3) |
+| `documentos__texto.vocab.dic` + `.postings.inv` + `.norms.dat` | `data/text/` | recuperación léxica (TF-IDF coseno y BM25 sobre el SPIMI de la Parte 3) |
 | `imagenes (id, categoria, archivo, emb VECTOR(512))` | `data/imagenes.heap.dat` | ResNet-18 de cada imagen |
 | `imagenes__idx_emb.ivf.*` | `data/` | paradigma moderno (IVF COSINE) |
 | `codebook_bovw (id, centro VECTOR(128))` | `data/codebook_bovw.heap.dat` | K palabras visuales (K-Means sobre SIFT) |
@@ -342,8 +377,9 @@ Enunciado 5.2 y 5.4. Código en `backend/text/` (`boolean.py`, `inverted.py`, SP
 
 - `CREATE INDEX ... USING INVERTED WITH (scoring = 'TFIDF_COSINE' | 'BM25')` sobre una
   columna `CHAR`. Archivos: `<t>__<idx>.inv.meta` (columna, scoring, si está
-  desactualizado), vocabulario B+ (`.inv.spimi.vocab.btree.dat`), postings ordenados
-  por RID (`.inv.spimi.post`) y normas (`.inv.norms.dat`).
+  desactualizado), diccionario `vocab.dic` (B+ paginado término → offset, df; el largo
+  de la lista es df), listas de posteo `postings.inv` ordenadas por RID y normas
+  (`.inv.norms.dat`).
 - `MATCH` con operadores (`AND`, `OR`, `NOT`, paréntesis; en mayúsculas) es booleano y
   se resuelve con mezclas de dos punteros en O(n + m); sin operadores es una consulta de
   ranking (OR de las palabras). `COSINE_SCORE()` / `BM25_SCORE()` eligen el score.
@@ -386,15 +422,6 @@ pg.write_page(page)                     # counter.disk_writes += 1
 page = pg.read_page(page.page_id)       # counter.disk_reads  += 1
 ```
 
-### Para quien implemente el B+ Tree
-
-- `page.next_page_id` / `page.prev_page_id` de la cabecera **ya son** los
-  `next_leaf_id` / `prev_leaf_id` que pide el enunciado para el recorrido por rango.
-- `pager.user_a` / `pager.user_b` son dos `uint32` persistentes en la cabecera del
-  archivo: usa `user_a` como `root_page_id`.
-- `page_capacity(page_size, record_size)` da el fan-out directamente, para la tabla del
-  Experimento 4.
-
 ### Hash Extensible
 
 Dos archivos por índice (`<tabla>__<indice>.hash.dir` y `.hash.bkt`), mismo
@@ -416,17 +443,6 @@ directorio. `Catalog.create_index`/`open_index` lo conectan al motor;
 | Fill factor | 0.75 uniforme | Enunciado 3.2.2 (70–80 %) |
 | Buffer pool | Opcional, apagado por defecto | Benchmarks sin caché validan la teoría; la demo con caché va rápida |
 
-Detalle completo en `docs/superpowers/specs/` y `docs/superpowers/plans/`.
-
-## Qué falta para cerrar el Proyecto 1
-
-- `BPlusTree` en `backend/index/btree.py`
-- Suite de los 4 experimentos (`POST /api/benchmarks/run`)
-
-Cada archivo pendiente documenta sus requisitos del enunciado y qué le da ya la capa de
-almacenamiento. Para conectar un índice nuevo al motor basta con registrarlo en
-`Catalog.indexes_of()` e implementar su rama en `Executor._rows_for()`: el planificador
-ya elige `IndexScan` e `IndexRangeScan` en cuanto detecta el índice.
 
 ## Limitaciones conocidas
 
