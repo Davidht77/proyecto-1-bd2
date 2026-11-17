@@ -6,8 +6,10 @@ Genera (si existe el CSV correspondiente):
     exp7_precision.pdf      Precision@5 / @10 por metodo (BoVW K vs ResNet exacto / IVF)
     exp7_costos.pdf         extraccion por imagen, latencia de consulta y bloques leidos
     exp7_texto.pdf          hit@10 y MRR de TF-IDF / BM25 / SBERT (7b)
-    exp8_recall.pdf         Recall@10 vs probes con latencia y bloques (IVF)
-    exp8_hibrido.pdf        PRE vs POST segun selectividad
+    exp6_construccion.pdf   tiempo y tamano del indice invertido vs GIN al crecer el corpus
+    exp6_consultas.pdf      latencia y bloques: indice vs GIN vs Full Text Scan
+    exp8_recall[_sbert].pdf Recall@10 vs probes con latencia y bloques (IVF)
+    exp8_hibrido[_sbert].pdf PRE vs POST segun selectividad
 Las figuras del Experimento 5 las produce generar.py (modulo espacial).
 """
 
@@ -114,51 +116,102 @@ if filas:
         ax.set_xticks(range(len(xs)), xs, fontsize=7)
     guardar(fig, "exp7_texto")
 
-# ----------------------------------------------------------------- Exp 8
+# ----------------------------------------------------------------- Exp 6
 
-filas = leer("exp8_ann.csv")
+filas = leer("exp6_construccion.csv")
 if filas:
-    exacto = next(r for r in filas if r["method"] == "exact")
-    ivf = sorted((r for r in filas if r["method"] == "ivf"), key=lambda r: int(r["probes"]))
-    probes = [int(r["probes"]) for r in ivf]
-    fig, ax1 = plt.subplots(figsize=(6.0, 3.4))
-    ax1.plot(probes, [100 * float(r["recall_at_10"]) for r in ivf], marker="o", color=COLORES[0], label="Recall@10 (%)")
-    ax1.set_xscale("log")
-    ax1.set_xticks(probes, [str(p) for p in probes])
-    ax1.set_xlabel("probes (celdas sondeadas)")
-    ax1.set_ylabel("Recall@10 (%)", color=COLORES[0])
-    ax1.set_ylim(0, 105)
-    ax2 = ax1.twinx()
-    ax2.plot(probes, [float(r["avg_reads"]) for r in ivf], marker="s", color=COLORES[1], label="bloques leídos")
-    ax2.axhline(float(exacto["avg_reads"]), color=COLORES[1], linestyle="--", linewidth=1)
-    ax2.annotate(f"k-NN exacto: {float(exacto['avg_reads']):.0f} bloques, {float(exacto['avg_ms']):.0f} ms",
-                 (probes[0], float(exacto["avg_reads"])), textcoords="offset points", xytext=(4, -12), fontsize=7.5)
-    ax2.set_yscale("log")
-    ax2.set_ylabel("Bloques leídos por consulta (log)", color=COLORES[1])
-    ax2.grid(False)
-    ax2.spines["right"].set_visible(True)
-    for p, r in zip(probes, ivf):
-        ax1.annotate(f"{float(r['avg_ms']):.0f} ms", (p, 100 * float(r["recall_at_10"])), textcoords="offset points",
-                     xytext=(0, -14), fontsize=7, ha="center")
-    guardar(fig, "exp8_recall")
-
-filas = leer("exp8_hibrido.csv")
-if filas:
-    s = defaultdict(list)
-    for r in filas:
-        s[r["strategy"]].append((100 * float(r["selectivity"]), float(r["avg_reads"]), float(r["avg_ms"])))
-    fig, axes = plt.subplots(1, 2, figsize=(7.6, 3.2))
-    for i, (estr, et) in enumerate((("PRE", "Pre-filtering (B+ → k-NN exacto)"), ("POST", "Post-filtering (IVF → filtro)"))):
-        pts = sorted(s[estr])
+    fig, axes = plt.subplots(1, 2, figsize=(7.6, 3.1))
+    for i, (m, et) in enumerate((("indice", "Índice invertido (SPIMI)"), ("gin", "GIN de PostgreSQL"))):
+        pts = sorted((int(r["n_docs"]), float(r["build_ms"]) / 1000, int(r["size_bytes"]) / 1e6)
+                     for r in filas if r["method"] == m)
+        if not pts:
+            continue
         axes[0].plot([p[0] for p in pts], [p[1] for p in pts], marker=MARCAS[i], color=COLORES[i], label=et)
         axes[1].plot([p[0] for p in pts], [p[2] for p in pts], marker=MARCAS[i], color=COLORES[i], label=et)
-    for ax, yl in zip(axes, ("Bloques leídos por consulta", "Latencia (ms)")):
+    for ax, yl in zip(axes, ("Tiempo de construcción (s)", "Tamaño en disco (MB)")):
         ax.set_xscale("log")
         ax.set_yscale("log")
-        ax.set_xticks([0.1, 1, 5, 25, 100], ["0,1", "1", "5", "25", "100"])
-        ax.set_xlabel("Selectividad del filtro (% de filas)")
+        ns = sorted({int(r["n_docs"]) for r in filas})
+        ax.set_xticks(ns, [f"{n // 1000}k" if n >= 1000 else str(n) for n in ns])
+        ax.set_xlabel("Documentos")
         ax.set_ylabel(yl)
     axes[0].legend(fontsize=7.5)
-    guardar(fig, "exp8_hibrido")
+    guardar(fig, "exp6_construccion")
+
+filas = leer("exp6_consultas.csv")
+if filas:
+    celdas = sorted({(int(r["n_terms"]), r["op"]) for r in filas}, key=lambda c: (c[0], ["AND", "OR", "AND-NOT", "TOPK"].index(c[1])))
+    xs = [f"{'Top-10' if op == 'TOPK' else op}\n{n} térm." for n, op in celdas]
+    metodos = (("indice", "Índice invertido"), ("gin", "GIN (PostgreSQL)"), ("full_scan", "Full Text Scan"))
+    fig, axes = plt.subplots(2, 1, figsize=(7.6, 5.0), sharex=True)
+    w = 0.27
+    for i, (m, et) in enumerate(metodos):
+        val = {(int(r["n_terms"]), r["op"]): r for r in filas if r["method"] == m}
+        if not val:
+            continue
+        pos = [k + (i - 1) * w for k in range(len(celdas))]
+        axes[0].bar(pos, [float(val[c]["avg_ms"]) if c in val else 0 for c in celdas], w, color=COLORES[i], label=et)
+        axes[1].bar(pos, [float(val[c]["avg_reads"]) if c in val else 0 for c in celdas], w, color=COLORES[i], label=et)
+    axes[0].set_ylabel("Latencia (ms, log)")
+    axes[1].set_ylabel("Bloques por consulta (log)")
+    for ax in axes:
+        ax.set_yscale("log")
+        ax.grid(axis="x", visible=False)
+    axes[1].set_xticks(range(len(celdas)), xs, fontsize=7.5)
+    axes[0].legend(fontsize=7.5, ncol=3, loc="lower center", bbox_to_anchor=(0.5, 1.0))
+    guardar(fig, "exp6_consultas")
+
+# ----------------------------------------------------------------- Exp 8
+
+
+def figuras_exp8(sufijo: str) -> None:
+    filas = leer(f"exp8_ann{sufijo}.csv")
+    if filas:
+        exacto = next(r for r in filas if r["method"] == "exact")
+        ivf = sorted((r for r in filas if r["method"] == "ivf"), key=lambda r: int(r["probes"]))
+        probes = [int(r["probes"]) for r in ivf]
+        fig, ax1 = plt.subplots(figsize=(6.0, 3.4))
+        ax1.plot(probes, [100 * float(r["recall_at_10"]) for r in ivf], marker="o", color=COLORES[0], label="Recall@10 (%)")
+        ax1.set_xscale("log")
+        ax1.set_xticks(probes, [str(p) for p in probes])
+        ax1.set_xlabel("probes (celdas sondeadas)")
+        ax1.set_ylabel("Recall@10 (%)", color=COLORES[0])
+        ax1.set_ylim(0, 105)
+        ax2 = ax1.twinx()
+        ax2.plot(probes, [float(r["avg_reads"]) for r in ivf], marker="s", color=COLORES[1], label="bloques leídos")
+        ax2.axhline(float(exacto["avg_reads"]), color=COLORES[1], linestyle="--", linewidth=1)
+        ax2.annotate(f"k-NN exacto: {float(exacto['avg_reads']):.0f} bloques, {float(exacto['avg_ms']):.0f} ms",
+                     (probes[0], float(exacto["avg_reads"])), textcoords="offset points", xytext=(4, -12), fontsize=7.5)
+        ax2.set_yscale("log")
+        ax2.set_ylabel("Bloques leídos por consulta (log)", color=COLORES[1])
+        ax2.grid(False)
+        ax2.spines["right"].set_visible(True)
+        for p, r in zip(probes, ivf):
+            ax1.annotate(f"{float(r['avg_ms']):.0f} ms", (p, 100 * float(r["recall_at_10"])), textcoords="offset points",
+                         xytext=(0, -14), fontsize=7, ha="center")
+        guardar(fig, f"exp8_recall{sufijo}")
+
+    filas = leer(f"exp8_hibrido{sufijo}.csv")
+    if filas:
+        s = defaultdict(list)
+        for r in filas:
+            s[r["strategy"]].append((100 * float(r["selectivity"]), float(r["avg_reads"]), float(r["avg_ms"])))
+        fig, axes = plt.subplots(1, 2, figsize=(7.6, 3.2))
+        for i, (estr, et) in enumerate((("PRE", "Pre-filtering (B+ → k-NN exacto)"), ("POST", "Post-filtering (IVF → filtro)"))):
+            pts = sorted(s[estr])
+            axes[0].plot([p[0] for p in pts], [p[1] for p in pts], marker=MARCAS[i], color=COLORES[i], label=et)
+            axes[1].plot([p[0] for p in pts], [p[2] for p in pts], marker=MARCAS[i], color=COLORES[i], label=et)
+        for ax, yl in zip(axes, ("Bloques leídos por consulta", "Latencia (ms)")):
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.set_xticks([0.1, 1, 5, 25, 100], ["0,1", "1", "5", "25", "100"])
+            ax.set_xlabel("Selectividad del filtro (% de filas)")
+            ax.set_ylabel(yl)
+        axes[0].legend(fontsize=7.5)
+        guardar(fig, f"exp8_hibrido{sufijo}")
+
+
+figuras_exp8("")        # sintético, N = 20k, D = 128, L2
+figuras_exp8("_sbert")  # embeddings SBERT reales del corpus del RAG, coseno
 
 print("listo")

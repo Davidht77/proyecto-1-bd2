@@ -45,13 +45,19 @@ INSERT INTO locales VALUES (1, 'Miraflores', POINT(-77.0282, -12.1354));
 CREATE INDEX idx_geo ON locales (ubicacion) USING RTREE;
 SELECT * FROM locales WHERE ubicacion WITHIN_RADIUS ((-77.0282, -12.1354), 2.5);
 SELECT * FROM locales WHERE ubicacion KNN ((-77.0282, -12.1354), 10);
+
+-- módulo textual
+CREATE INDEX idx_texto ON documentos (texto) USING INVERTED WITH (scoring = 'TFIDF_COSINE');
+SELECT id, titulo, COSINE_SCORE() AS relevancia FROM documentos
+WHERE texto MATCH 'aprendizaje AND profundo AND NOT basico'
+ORDER BY relevancia DESC LIMIT 10;
 ```
 
 `USING HEAP` y `USING SEQUENTIAL` funcionan. `CREATE INDEX ... USING HASH` construye
 un Hashing Dinámico sobre disco y habilita `IndexScan` en el planificador.
 `CREATE INDEX ... USING BTREE` construye el árbol B+; `USING RTREE` indexa columnas
-`POINT`. `MATCH`, `WITHIN_RADIUS` y `KNN` se parsean; los predicados espaciales ya
-se ejecutan y `MATCH` sigue pendiente del módulo textual.
+`POINT`; `USING INVERTED` indexa columnas de texto para `MATCH`. `WITHIN_RADIUS`,
+`KNN` y `MATCH` se ejecutan con su índice o, si no hay, con un recorrido de la tabla.
 
 ## API REST
 
@@ -128,6 +134,7 @@ CREATE INDEX idx_vec ON multimedia (embedding) USING IVF WITH (lists = 100, metr
 
 SET ivf.probes = 5;                 -- celdas que escanea el IVF
 SET hybrid.strategy = 'AUTO';       -- AUTO | PRE | POST (forzar, para experimentos)
+SET vector.scan = 'AUTO';           -- AUTO | EXACT (ignora el IVF: k-NN exacto, misma métrica)
 
 SELECT id, categoria, precio, embedding <=> '[0.12, -0.34, ...]' AS dist_coseno
 FROM multimedia
@@ -148,6 +155,12 @@ ruta de acceso y evalúa el resto como filtro residual. También hay `ORDER BY <
 | `WHERE` indexable, sin IVF | `PreFilter` | B+/Hash/clave entrega candidatos → k-NN exacto |
 | `WHERE` no indexable, con IVF | `PostFilter` | candidatos IVF en orden → filtro; amplía el sondeo si no alcanza |
 | `WHERE` indexable y con IVF | `PreFilter` / `PostFilter` | decide `hybrid.choose_strategy` con un conteo real del índice |
+| `MATCH` + distancia | `TextPreFilter` | el índice invertido filtra → k-NN exacto sobre los candidatos |
+
+`hybrid.choose_strategy` estima los bloques de cada estrategia: PRE ≈ filas que cumplen
+el filtro (una lectura de tabla por fila); POST ≈ páginas de las celdas necesarias para
+revisar k/selectividad candidatos + una lectura de tabla por candidato. Gana la menor;
+ante un empate, PRE (es exacto).
 
 Cada consulta reporta en `plan.io` las lecturas **del índice** y **de la tabla** por
 separado (enunciado 5.4). El panel de métricas del cliente web las dibuja.
@@ -172,10 +185,14 @@ separado (enunciado 5.4). El panel de métricas del cliente web las dibuja.
 ```bash
 python -m backend.benchmarks.experiment8                  # sintético, N=20k, D=128
 python -m backend.benchmarks.experiment8 --npy emb.npy    # embeddings reales (N, D)
+python -m backend.benchmarks.experiment8 --csv data/datasets/wiki_20k.csv --metric COSINE
+#   embeddings SBERT del corpus del RAG (se calculan una vez en <csv>.sbert.npy);
+#   las consultas son documentos reales que se dejan fuera de la tabla
 ```
 
 Escribe `benchmarks/results/exp8_ann.csv` (Recall@10 / ms / bloques vs `probes`, con el
-k-NN exacto como verdad de campo) y `exp8_hibrido.csv` (PRE vs POST según selectividad).
+k-NN exacto como verdad de campo) y `exp8_hibrido.csv` (PRE vs POST según selectividad);
+con `--csv`, `exp8_ann_sbert.csv` y `exp8_hibrido_sbert.csv`.
 
 ## Aplicación de IA y módulo multimedia (Rol 4)
 
@@ -305,19 +322,40 @@ dimensionalidad para D = 2…128). Las figuras y el informe están en
 `informe_analisis/experimento5_rtree.tex` (requiere `matplotlib` para
 `informe_analisis/figuras/generar.py`).
 
-### Contrato para el módulo textual
+### Módulo textual en SQL (índice invertido)
 
-`MATCH '<consulta>'` y `COSINE_SCORE()` ya se parsean (`TextMatch`, `ScoreExpr`
-en `parser.py`). El executor sigue respondiendo 501 hasta conectar el índice
-invertido. Para hacerlo: registrar el índice en `Catalog.indexes_of()` y
-reemplazar el `NotImplementedFeature` de `Executor._select`.
+Enunciado 5.2 y 5.4. Código en `backend/text/` (`boolean.py`, `inverted.py`, SPIMI) y
+`Executor._select_text`.
 
-El RAG y el BoVW ya usan el SPIMI (`backend/text/spimi.py`) tal como está:
-`build_index(..., tokenize=)` acepta un tokenizador alternativo (las palabras
-visuales no pasan por stopwords ni stemming) y `backend/multimedia/tfidf.py`
-agrega el archivo de normas y el CosineScore sobre esos mismos postings. Cuando
-`MATCH` se conecte al planificador, `RagService.retrieve_lexical` puede pasar a
-ejecutarse como SQL sin cambiar el resto del pipeline.
+- `CREATE INDEX ... USING INVERTED WITH (scoring = 'TFIDF_COSINE' | 'BM25')` sobre una
+  columna `CHAR`. Archivos: `<t>__<idx>.inv.meta` (columna, scoring, si está
+  desactualizado), vocabulario B+ (`.inv.spimi.vocab.btree.dat`), postings ordenados
+  por RID (`.inv.spimi.post`) y normas (`.inv.norms.dat`).
+- `MATCH` con operadores (`AND`, `OR`, `NOT`, paréntesis; en mayúsculas) es booleano y
+  se resuelve con mezclas de dos punteros en O(n + m); sin operadores es una consulta de
+  ranking (OR de las palabras). `COSINE_SCORE()` / `BM25_SCORE()` eligen el score.
+- Ruta `InvertedIndexScan` (filtro y refinamiento): el índice da los documentos y su
+  score sin tocar la tabla; después se leen las filas por RID en orden de relevancia,
+  se aplican los demás predicados y con `LIMIT` se para al juntar k. Sin índice:
+  `TextSeqScan` (mismo resultado, lee toda la tabla).
+- Un `INSERT`, `DELETE` o reorganización marca el índice como desactualizado y el
+  siguiente `MATCH` lo reconstruye (el plan lo indica).
+
+El RAG y el BoVW usan los mismos archivos SPIMI: `build_index(..., tokenize=)` acepta un
+tokenizador alternativo (las palabras visuales no pasan por stopwords ni stemming).
+
+### Experimento 6
+
+```bash
+docker run -d --name bd2-pg -e POSTGRES_PASSWORD=bd2 -e POSTGRES_DB=bd2 -p 55432:5432 postgres:16-alpine
+python -m backend.benchmarks.experiment6 --csv data/datasets/wiki_20k.csv   # corpus: python -m backend.rag.download --n 10000 --out data/datasets/wiki_20k.csv
+python -m backend.benchmarks.experiment6 --no-pg                            # sin PostgreSQL
+```
+
+Escribe `exp6_construccion.csv` (tiempo y tamaño del índice vs GIN, 1k → 20k documentos)
+y `exp6_consultas.csv` (AND, OR, AND-NOT y Top-10 de 1, 3 y 5 términos: índice vs Full
+Text Scan vs GIN). PostgreSQL es solo la referencia externa del enunciado (necesita
+`psycopg2`); el motor no lo usa.
 
 ## Contrato con el resto del equipo
 

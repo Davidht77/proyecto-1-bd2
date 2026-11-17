@@ -44,7 +44,7 @@ WITH (metric = 'COSINE')}. La consulta es SQL ordinario del módulo vectorial:
 
 \begin{lstlisting}
 SELECT id, categoria, archivo, emb <=> '[...]' AS dist
-FROM imagenes ORDER BY dist ASC LIMIT 10;      -- IVFScan (o KnnSeqScan con <->)
+FROM imagenes ORDER BY dist ASC LIMIT 10;      -- IVFScan (o KnnSeqScan con SET vector.scan = 'EXACT')
 \end{lstlisting}
 
 \begin{figure}[H]

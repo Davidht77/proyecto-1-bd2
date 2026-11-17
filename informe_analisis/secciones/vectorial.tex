@@ -1,57 +1,128 @@
 \section{Módulo vectorial: IVF en disco y planificador híbrido}
 \label{sec:vectorial}
 
-% ---------------------------------------------------------------------------
-% ROL 3: primera versión redactada por el Rol 4 a partir del README y de
-% benchmarks/results/exp8_*.csv para que el informe compile completo. Ajusta lo
-% que haga falta (sobre todo el análisis del 8b y los diagramas).
-% ---------------------------------------------------------------------------
-
 \subsection{El tipo \code{VECTOR(D)} y la búsqueda exacta}
 
 Un \code{VECTOR(D)} son $D$ \code{float32} contiguos ($4D$ bytes), así que sigue siendo
 un tipo de ancho fijo y toda la maquinaria de páginas, bitmap y RID del Proyecto 1 se
-aplica sin cambios. Las distancias soportadas son L2 (\code{<->}) y coseno
-$1-\cos\theta$ (\code{<=>}). La línea base es el k-NN lineal
-(\code{backend/vector/knn.py}): recorre la tabla por lotes, calcula las distancias con
-\code{numpy} y mantiene los $k$ mejores en un Max-Heap de tamaño $k$, de modo que un
-candidato nuevo se compara con la raíz en $O(1)$ y entra en $O(\log k)$. Es la verdad
-de campo del Experimento 8 y la ruta \code{KnnSeqScan} del planificador.
+aplica sin cambios. Se eligió \code{float32} y no \code{float64} porque en un índice en
+disco la métrica que manda es cuántos bloques se leen: con 4 bytes por componente caben
+el doble de vectores por página. Las distancias soportadas son L2 (\code{<->}) y coseno
+$1-\cos\theta$ (\code{<=>}); un vector de norma cero queda a distancia 1 de todos.
+
+La línea base es el k-NN lineal (\code{backend/vector/knn.py}): recorre la tabla por
+lotes de 1024 filas, calcula las distancias con \code{numpy} y mantiene los $k$ mejores
+en un Max-Heap de tamaño $k$ (en Python, un \code{heapq} con distancias negadas). Un
+candidato nuevo se compara con la raíz en $O(1)$ y entra en $O(\log k)$, así que el
+costo es $O(N\log k)$ en tiempo y $O(k)$ en memoria. La búsqueda por radio
+(\code{range\_linear}) devuelve todos los vectores a distancia $\le r$. Es la verdad de
+campo del Experimento~8 y la ruta \code{KnnSeqScan} del planificador.
 
 \subsection{Diseño en disco del IVF}
 
-El espacio se parte en $C=\lfloor\sqrt{N}\rfloor$ celdas de Voronoi con K-Means++
-(esférico cuando la métrica es coseno). Dos archivos paginados:
+El espacio se parte en $C=\lfloor\sqrt{N}\rfloor$ celdas de Voronoi con K-Means++ seguido
+de iteraciones de Lloyd; con la métrica coseno se usa K-Means esférico (los vectores se
+normalizan antes de agrupar). Para no cargar toda la tabla en RAM, K-Means entrena con
+una muestra de hasta $256\,C$ vectores y luego cada vector se asigna a su centroide más
+cercano. El índice son dos archivos paginados por el \code{Pager}, ambos
+autodescriptivos (se reabren sin metadatos externos):
 
 \begin{table}[H]
 \centering\small
 \begin{tabularx}{\textwidth}{llY}
 \toprule
-Archivo & Registro & Metadatos \\
+Archivo & Registro & Metadatos en la página 0 \\
 \midrule
-\code{<t>\_\_<idx>.ivf.dir} & $\langle$centroide \code{VECTOR(D)}, cluster\_id, head, tail, count$\rangle$ & \code{user\_a} = métrica, \code{user\_b} = $C$ \\
-\code{<t>\_\_<idx>.ivf.lst} & $\langle$pk, page, slot, area, vec$\rangle$, una cadena de páginas por celda & \code{user\_a} = $N$ \\
+\code{<t>\_\_<idx>.ivf.dir} & $\langle\mu_c$ \code{VECTOR(D)}, cluster\_id, head, tail, count$\rangle$ & \code{user\_a} = métrica, \code{user\_b} = $C$ \\
+\code{<t>\_\_<idx>.ivf.lst} & $\langle$pk, page, slot, area, $\vec v\rangle$, una cadena de páginas por celda & \code{user\_a} = $N$ \\
 \bottomrule
 \end{tabularx}
+\caption{Archivos del índice IVF.}
 \end{table}
 
-Las listas son densas y una página se decodifica de una vez con
-\code{numpy.frombuffer}. Se guarda la clave primaria junto al RID porque en este motor
-los RID no son estables (move-the-last del Heap, inserción ordenada y
-\code{reorganize()} del Sequential): al leer un candidato se verifica la PK y, si el
-RID quedó obsoleto, la fila se recupera por clave (\code{plan.stale\_rids}). Los
-centroides se leen una vez al abrir el índice y quedan en RAM, como hacen los motores
-reales con el cuantizador.
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  pg/.style={draw, rounded corners=1pt, minimum width=1.45cm, minimum height=0.85cm,
+             font=\scriptsize, align=center},
+  >={Stealth[length=2mm]}, node distance=0.22cm]
+  \node[font=\footnotesize\bfseries, anchor=west] at (-0.75,3.05)
+       {\texttt{.ivf.dir}: directorio de centroides (se lee una vez y queda en RAM)};
+  \node[pg, fill=gray!15] (h) at (0,2.3) {pág.\ 0\\cabecera};
+  \node[pg, fill=blue!10, right=of h] (e0) {celda 0\\$\mu_0$, head, tail};
+  \node[pg, fill=blue!10, right=of e0] (e1) {celda 1\\$\mu_1$, head, tail};
+  \node[right=of e1] (ed) {$\cdots$};
+  \node[pg, fill=blue!10, right=of ed] (ec) {celda $C{-}1$};
 
-\subsection{Gramática y planificador híbrido}
+  \node[font=\footnotesize\bfseries, anchor=west] at (-0.75,-1.25)
+       {\texttt{.ivf.lst}: listas invertidas, una cadena de páginas por celda};
+  \node[pg, fill=gray!15] (l0) at (0,0) {pág.\ 0\\cabecera};
+  \node[pg, fill=orange!18, right=of l0] (a1) {pág.\ 1};
+  \node[pg, fill=orange!18, right=of a1] (a2) {pág.\ 2};
+  \node[pg, fill=orange!18, right=of a2] (a3) {pág.\ 3};
+  \node[pg, fill=green!14, right=0.55cm of a3] (b1) {pág.\ 4};
+  \node[pg, fill=green!14, right=of b1] (b2) {pág.\ 5};
+  \node[right=of b2] (bd) {$\cdots$};
+  \draw[->] (a1) -- (a2);
+  \draw[->] (a2) -- (a3);
+  \draw[->] (b1) -- (b2);
+  \draw[->, blue!60!black] (e0.south) -- node[left, font=\scriptsize] {head} (a1.north);
+  \draw[->, blue!60!black, dashed] (e0.south) -- node[right, font=\scriptsize] {tail} (a3.north);
+  \draw[->, green!40!black] (e1.south) -- (b1.north);
+  \node[font=\scriptsize, below=0.12cm of a2] {celda 0 (\texttt{next\_page\_id})};
+  \node[font=\scriptsize, below=0.12cm of b1.south east] {celda 1};
+\end{tikzpicture}
+
+\vspace{0.4cm}
+\begin{tikzpicture}[cell/.style={draw, minimum height=0.75cm, font=\scriptsize, align=center}]
+  \node[cell, fill=gray!15, minimum width=1.7cm] (c1) at (0,0) {cabecera\\32 B};
+  \node[cell, fill=gray!6, minimum width=1.1cm, right=0pt of c1] (c2) {bitmap};
+  \node[cell, fill=orange!18, minimum width=3.3cm, right=0pt of c2] (c3) {$\langle$pk, page, slot, area, $\vec v\rangle$};
+  \node[cell, fill=orange!18, minimum width=3.3cm, right=0pt of c3] (c4) {$\langle$pk, page, slot, area, $\vec v\rangle$};
+  \node[cell, minimum width=0.9cm, right=0pt of c4] (c5) {$\cdots$};
+  \node[font=\scriptsize, below=0.1cm of c3.south east] {página de 4096 B: 7 registros con $D=128$, 2 con $D=384$};
+\end{tikzpicture}
+\caption{Diseño físico del IVF. Cada celda del directorio apunta a la primera y a la última
+página de su lista; las páginas de una lista se encadenan, así que una celda crece sin mover
+a las demás. Abajo, el layout de una página de lista.}
+\label{fig:ivf-disco}
+\end{figure}
+
+\paragraph{Operaciones.} La construcción ordena los vectores por celda y escribe cada lista
+en páginas contiguas. Un \code{INSERT} agrega el vector al final de la página cola de su
+celda (una lectura y una escritura) y un \code{DELETE} tapa el hueco con el último registro
+de la cadena (\emph{move-the-last}) y libera la página cola si queda vacía. Una consulta
+ordena las celdas por distancia de $\vec q$ a cada centroide (sin I/O, porque el directorio
+está en RAM) y lee solo las páginas de las \code{probes} primeras; cada página se decodifica
+de una vez con un \code{dtype} estructurado de \code{numpy} en vez de registro por
+registro.
+
+\paragraph{RIDs que se mueven.} El índice guarda el RID físico de cada fila para ir directo
+a la tabla, pero en este motor los RID cambian: el Heap borra con move-the-last y el
+Sequential desplaza slots al insertar en orden y renumera todo al reorganizar. Por eso el
+registro guarda también la clave primaria: al leer un candidato se verifica la PK y, si el
+RID quedó obsoleto, la fila se recupera por clave (\code{plan.stale\_rids}). Además, al
+borrar en un Heap el executor avisa al IVF del nuevo RID de la fila que se movió. Es el
+mismo problema que resuelven los índices secundarios de InnoDB guardando la clave primaria
+en lugar de la dirección física.
+
+\subsection{Gramática extendida y planificador}
 
 \begin{lstlisting}
 CREATE INDEX idx_vec ON multimedia (embedding) USING IVF WITH (lists = 100, metric = 'COSINE');
-SET ivf.probes = 5;
+SET ivf.probes = 5;            -- celdas que revisa cada consulta
+SET hybrid.strategy = 'AUTO';  -- o 'PRE' / 'POST' para forzar (experimentos)
+SET vector.scan = 'AUTO';      -- o 'EXACT': ignora el IVF y hace k-NN exacto
 SELECT id, categoria, precio, embedding <=> '[0.12, -0.34, ...]' AS d
 FROM multimedia WHERE categoria = 'footwear' AND precio <= 250.0
 ORDER BY d ASC LIMIT 5;
 \end{lstlisting}
+
+El parser del Proyecto~1 se extendió con los operadores \code{<->} y \code{<=>}, el
+\code{SET} de opciones, \code{CREATE INDEX ... WITH (...)}, \code{WHERE} con varias
+columnas unidas por \code{AND}, \code{ORDER BY} y \code{LIMIT}, y los predicados de los
+otros módulos (\code{MATCH}, \code{WITHIN\_RADIUS}, \code{COSINE\_SCORE()}). Ante una
+consulta con \code{ORDER BY distancia LIMIT k} el planificador elige entre:
 
 \begin{table}[H]
 \centering\small
@@ -59,27 +130,74 @@ ORDER BY d ASC LIMIT 5;
 \toprule
 Situación & Ruta & Qué hace \\
 \midrule
-sin \code{WHERE}, sin IVF & \code{KnnSeqScan} & k-NN exacto con Max-Heap \\
+sin \code{WHERE}, sin IVF con la métrica del operador & \code{KnnSeqScan} & k-NN exacto con Max-Heap \\
 sin \code{WHERE}, con IVF & \code{IVFScan} & escanea las \code{ivf.probes} celdas más cercanas \\
 \code{WHERE} indexable, sin IVF & \code{PreFilter} & B+/Hash entrega candidatos $\to$ k-NN exacto \\
 \code{WHERE} no indexable, con IVF & \code{PostFilter} & candidatos IVF en orden $\to$ filtro; amplía el sondeo si no alcanza \\
-\code{WHERE} indexable y con IVF & \code{PreFilter} / \code{PostFilter} & decide \code{hybrid.choose\_strategy} con un conteo real del índice \\
+\code{WHERE} indexable y con IVF & \code{PreFilter} / \code{PostFilter} & decide el modelo de costos \\
+\code{MATCH} + distancia & \code{TextPreFilter} & el índice invertido filtra $\to$ k-NN exacto (sección~\ref{sec:textual}) \\
 \bottomrule
 \end{tabularx}
+\caption{Rutas de acceso de una consulta vectorial.}
 \end{table}
 
-La decisión minimiza bloques leídos: el planificador paga unas pocas páginas del
-índice relacional para contar (con tope) cuántas filas cumplen el filtro, estima el
-costo de PRE (una lectura de tabla por fila que pasa) y de POST (páginas de las
-listas sondeadas más una lectura de tabla por candidato revisado) y, ante empate,
-elige PRE porque su resultado es exacto. Cada consulta reporta en \code{plan.io} las
-lecturas del índice y de la tabla por separado, que el cliente web dibuja.
+\paragraph{Post-filtering con profundización iterativa.} Los candidatos del IVF llegan en
+orden de distancia; a cada uno se le lee la fila, se le aplica el \code{WHERE} y la búsqueda
+para al juntar $k$ que cumplan. Si las \code{probes} celdas no alcanzan, se duplica el lote
+de celdas y se sigue, así que nunca se devuelven menos de $k$ filas cuando existen. El plan
+reporta cuántas ampliaciones hizo.
+
+\paragraph{Modelo de costos (\code{hybrid.choose\_strategy}).} Antes de decidir, el
+planificador cuenta cuántas filas cumplen el filtro recorriendo solo el índice relacional
+(búsqueda en el Hash o rango del B+), con un tope de 2000: pasado ese número el
+pre-filtrado ya no puede ganar. Con $m$ filas que cumplen, $N$ filas, selectividad
+$s=m/N$, $C$ celdas de $\bar p$ páginas en promedio y $k$ resultados pedidos:
+\[
+\text{costo}_{\text{PRE}} \approx m
+\qquad
+\text{costo}_{\text{POST}} \approx \min\!\Big(C,\ \max\!\big(\text{probes},\ \big\lceil \tfrac{k/s}{N/C}\big\rceil\big)\Big)\cdot \bar p \;+\; \frac{k}{s}
+\]
+PRE paga una lectura de tabla por fila que cumple (el B+ no está agrupado, así que filas
+vecinas en el índice caen en páginas distintas). POST necesita revisar unos $k/s$
+candidatos para juntar $k$ aciertos, cada uno con su lectura de tabla, y esos candidatos
+salen de las listas más cercanas, que aportan $N/C$ vectores cada una. Gana la estrategia
+con menos bloques; ante un empate gana PRE porque su resultado es exacto, mientras que
+POST hereda el recall aproximado del IVF. La razón de la decisión, con los dos costos
+estimados, aparece en el panel del plan del cliente web. Contra los datos del
+Experimento~8b el modelo elige PRE al 0,1\,\% y al 1\,\% y POST desde el 5\,\%, igual que
+lo medido.
+
+\paragraph{Bloques o tiempo.} El modelo minimiza bloques porque es lo que mide el
+\code{DiskCounter} y no depende de la máquina. Al 5\,\% esa elección tiene un costo
+visible: POST lee 3 veces menos bloques que PRE (333 frente a 1009) pero tarda más del
+doble (83 frente a 35~ms). Las lecturas de PRE son baratas de procesar (traer una fila),
+mientras que POST calcula distancias y evalúa el filtro sobre cada candidato. En un disco
+real, donde cada lectura cuesta milisegundos, la decisión por bloques es la correcta; con
+el archivo en la caché del sistema operativo, como en este experimento, el tiempo de CPU
+pesa más. Es una decisión de diseño que se documenta y no un error del modelo.
+
+\paragraph{Búsqueda exacta forzada.} \code{SET vector.scan = 'EXACT'} hace que el
+planificador ignore el IVF y resuelva el k-NN exacto con la misma métrica de la consulta.
+Lo usa la aplicación RAG para comparar en vivo la ruta exacta con la aproximada sobre el
+mismo índice coseno, y reemplaza el atajo anterior de consultar con \code{<->} para que no
+hubiera un IVF aplicable (que mostraba distancias en otra escala).
+
+\paragraph{I/O desglosado.} Antes y después de cada consulta se toma una foto del contador
+de cada índice de la tabla y del contador de la tabla, y el plan reporta
+\code{index\_reads} y \code{table\_reads} por separado (el enunciado lo pide en 5.4). El
+cliente web los dibuja como dos barras.
 
 \subsection{Experimento 8: eficiencia vs. calidad en ANN}
 
-Datos sintéticos con estructura de clusters ($N=20\,000$, $D=128$, mezcla de 64
-gaussianas), 100 consultas, $k=10$, $C=141$ celdas. La verdad de campo es el k-NN
-exacto.
+Se midió dos veces: con datos sintéticos de estructura conocida y con los embeddings reales
+de la aplicación RAG. En ambos casos la verdad de campo es el k-NN exacto, $k=10$, y todo
+pasa por SQL real a través del executor, así que las métricas son las mismas que muestra
+el cliente web.
+
+\subsubsection{Datos sintéticos (L2)}
+
+$N=20\,000$ vectores de $D=128$ (mezcla de 64 gaussianas), 100 consultas (un punto de la
+tabla con ruido), $C=141$ celdas.
 
 \begin{table}[H]
 \centering\small
@@ -96,22 +214,22 @@ IVF & 20 & 1,000 & 18,7 & 472,1 & 462,1 / 10 \\
 IVF & 50 & 1,000 & 36,4 & 1114,5 & 1104,5 / 10 \\
 \bottomrule
 \end{tabular}
-\caption{Experimento 8a (\code{exp8\_ann.csv}): Recall@10, latencia media y bloques leídos por consulta al variar \code{ivf.probes}.}
+\caption{Experimento 8a sintético (\code{exp8\_ann.csv}): Recall@10, latencia media y bloques leídos por consulta al variar \code{ivf.probes}.}
 \end{table}
 
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.78\textwidth]{exp8_recall}
-\caption{Curva de compromiso del IVF: el recall crece con \code{probes} mientras los bloques leídos crecen linealmente; con 5 celdas se alcanza recall 1 leyendo 22 veces menos bloques que el escaneo completo.}
+\caption{Curva de compromiso del IVF con datos sintéticos: el recall crece con \code{probes} mientras los bloques leídos crecen linealmente; con 5 celdas se alcanza recall 1 leyendo 22 veces menos bloques que el escaneo completo.}
 \end{figure}
 
 Con una sola celda el IVF ya recupera el 73\,\% de los vecinos verdaderos leyendo
 39 bloques frente a los 2858 del escaneo (73 veces menos); con 5 celdas el recall es
 1,0 y el costo sigue 22 veces por debajo. A partir de ahí sondear más celdas solo
-suma I/O: la curva es la ``rodilla'' clásica del Recall vs.\ costo y justifica el
-valor por defecto \code{ivf.probes = 5}. Las 10 lecturas de tabla son constantes
-(una página por cada uno de los $k$ resultados), así que todo el costo variable es
-del índice.
+suma I/O: es la ``rodilla'' clásica de la curva Recall vs.\ costo. Las 10 lecturas de
+tabla son constantes (una página por cada uno de los $k$ resultados), así que todo el
+costo variable es del índice. Cada celda tiene unos $20\,000/141\approx142$ vectores en
+$\approx21$ páginas, lo que explica los $\approx24$ bloques que suma cada celda sondeada.
 
 \begin{table}[H]
 \centering\small
@@ -131,19 +249,95 @@ Selectividad & Estrategia & Recall@10 & ms & bloques & índice / tabla & ampliac
 100\,\% & POST & 1,00 & 9,9 & 136,3 & 126 / 10 & 0 \\
 \bottomrule
 \end{tabular}
-\caption{Experimento 8b (\code{exp8\_hibrido.csv}): pre- vs.\ post-filtrado con B+ sobre \code{precio} e IVF con 5 probes, forzando la estrategia con \code{SET hybrid.strategy}.}
+\caption{Experimento 8b sintético (\code{exp8\_hibrido.csv}): pre- vs.\ post-filtrado con B+ sobre \code{precio} e IVF con 5 probes, forzando la estrategia con \code{SET hybrid.strategy}.}
 \end{table}
 
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.95\textwidth]{exp8_hibrido}
-\caption{Costo de PRE y POST según la selectividad del filtro. Las curvas se cruzan entre el 1\,\% y el 5\,\%: ahí cambia la decisión del planificador.}
+\caption{Costo de PRE y POST según la selectividad del filtro (sintético). Las curvas de bloques se cruzan entre el 1\,\% y el 5\,\%: ahí cambia la decisión del planificador.}
 \end{figure}
 
 El cruce está entre 1\,\% y 5\,\% de selectividad. Con filtros muy selectivos el
 post-filtrado descarta casi todos los candidatos del IVF y debe ampliar el sondeo
 (3,6 veces en promedio al 0,1\,\%), leyendo 600 veces más bloques que el pre-filtrado
-y aun así con recall menor que 1; con filtros poco selectivos el pre-filtrado degenera
+y aun así con recall menor que 1. Con filtros poco selectivos el pre-filtrado degenera
 en un escaneo de la tabla (20\,124 bloques al 100\,\%) mientras el IVF resuelve la
-consulta con 136. El estimador del planificador reproduce esta frontera con el conteo
-real del índice relacional, que es lo que el Experimento 8b calibra.
+consulta con 136. La pérdida de recall del post-filtrado al 1\,\% (0,88) es otra razón,
+además del costo, para preferir PRE con filtros muy selectivos.
+
+\subsubsection{Embeddings reales del RAG (coseno)}
+
+Los mismos 20\,000 artículos de Wikipedia del Experimento~6, con el embedding SBERT
+(\code{paraphrase-multilingual-MiniLM-L12-v2}, 384 dimensiones, norma 1) de
+``título. texto'', como los guarda la aplicación RAG. Las 100 consultas son artículos
+reales que se dejan fuera de la tabla, así que la tabla tiene $N=19\,900$ vectores; IVF
+coseno con $C=141$ celdas. Con $D=384$ un registro de lista mide 1552 bytes y caben 2 por
+página, frente a 7 con $D=128$: cada celda ocupa unas 70 páginas.
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{lrrrrr}
+\toprule
+Método & probes & Recall@10 & ms & bloques & índice / tabla \\
+\midrule
+k-NN exacto & --- & 1,000 & 545,5 & 9950 & 0 / 9950 \\
+IVF & 1 & 0,728 & 9,6 & 96 & 86 / 10 \\
+IVF & 2 & 0,823 & 10,1 & 167 & 157 / 10 \\
+IVF & 5 & 0,919 & 14,9 & 384 & 374 / 10 \\
+IVF & 10 & 0,955 & 20,0 & 737 & 727 / 10 \\
+IVF & 20 & 0,974 & 33,7 & 1409 & 1399 / 10 \\
+IVF & 50 & 0,992 & 80,3 & 3555 & 3545 / 10 \\
+\bottomrule
+\end{tabular}
+\caption{Experimento 8a con embeddings SBERT (\code{exp8\_ann\_sbert.csv}).}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.78\textwidth]{exp8_recall_sbert}
+\caption{Curva de compromiso del IVF con embeddings SBERT reales: la rodilla aparece más tarde que con datos sintéticos.}
+\end{figure}
+
+Los embeddings reales no forman grupos tan nítidos como la mezcla de gaussianas: muchos
+vecinos verdaderos caen en celdas vecinas, así que con 5 celdas el recall es 0,919 y no 1.
+Para pasar de 0,95 hacen falta 10 celdas, que siguen leyendo 13,5 veces menos bloques que
+el k-NN exacto (737 frente a 9950) y responden 27 veces más rápido (20 frente a 545\,ms).
+Para la aplicación RAG, \code{ivf.probes = 10} es un mejor punto de operación que 5.
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{rllrrr}
+\toprule
+Selectividad & Estrategia & Recall@10 & ms & bloques & índice / tabla \\
+\midrule
+0,1\,\% & PRE & 1,00 & 6,5 & 22 & 2 / 20 \\
+0,1\,\% & POST & 0,82 & 2241,7 & 14061 & 5552 / 8509 \\
+1\,\% & PRE & 1,00 & 10,9 & 203 & 3 / 200 \\
+1\,\% & POST & 0,63 & 253,2 & 1828 & 897 / 931 \\
+5\,\% & PRE & 1,00 & 37,8 & 1003 & 7 / 996 \\
+5\,\% & POST & 0,67 & 61,4 & 554 & 352 / 203 \\
+25\,\% & PRE & 1,00 & 182,5 & 5004 & 28 / 4976 \\
+25\,\% & POST & 0,85 & 20,5 & 388 & 352 / 37 \\
+100\,\% & PRE & 1,00 & 742,7 & 20023 & 123 / 19900 \\
+100\,\% & POST & 0,91 & 13,8 & 362 & 352 / 10 \\
+\bottomrule
+\end{tabular}
+\caption{Experimento 8b con embeddings SBERT (\code{exp8\_hibrido\_sbert.csv}), 5 probes.}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{exp8_hibrido_sbert}
+\caption{PRE vs.\ POST con embeddings SBERT. El cruce en bloques sigue entre el 1\,\% y el 5\,\%.}
+\end{figure}
+
+El cruce en bloques se mantiene entre el 1\,\% y el 5\,\%, así que el modelo de costos toma
+la misma decisión con datos reales que con sintéticos. Lo que cambia es la calidad del
+post-filtrado: con 5 celdas su recall cae a entre 0,63 y 0,91, porque al recall ya
+imperfecto del IVF se suma que el filtro descarta vecinos y obliga a buscar los
+reemplazos en celdas que no se sondearon. Al 5\,\% POST lee la mitad de bloques que PRE
+pero recupera solo dos tercios de los vecinos verdaderos. Con embeddings reales conviene
+entonces subir \code{ivf.probes} cuando el planificador elige POST, o desplazar el umbral
+hacia PRE; el modelo actual minimiza bloques y deja esa decisión de calidad a
+\code{SET ivf.probes} y \code{SET hybrid.strategy}, que el usuario controla.
