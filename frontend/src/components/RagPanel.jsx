@@ -24,18 +24,21 @@ function bytes(n) {
 
 /** Pinta las citas [n] de la respuesta como chips enlazadas a la fuente. */
 function Respuesta({ texto }) {
-  const partes = texto.split(/(\[\d+\])/g)
+  // Acepta [1], [1][2] y la forma agrupada [1, 2] que a veces escribe el modelo.
+  const partes = texto.split(/(\[\d+(?:\s*,\s*\d+)*\])/g)
   return (
     <p className="answer-text">
       {partes.map((p, i) => {
-        const m = p.match(/^\[(\d+)\]$/)
-        return m ? (
-          <a key={i} className="cite" href={`#fuente-${m[1]}`}>
-            {m[1]}
-          </a>
-        ) : (
-          <span key={i}>{p}</span>
-        )
+        const m = p.match(/^\[([\d,\s]+)\]$/)
+        if (!m) return <span key={i}>{p}</span>
+        return m[1]
+          .split(',')
+          .map((n) => n.trim())
+          .map((n) => (
+            <a key={`${i}-${n}`} className="cite" href={`#fuente-${n}`}>
+              {n}
+            </a>
+          ))
       })}
     </p>
   )

@@ -16,3 +16,6 @@ data/*
 # artefactos de desarrollo
 .playwright-mcp/
 *.png
+
+# secretos locales (claves de LLM)
+.env

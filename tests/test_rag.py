@@ -135,7 +135,7 @@ def test_detect_provider_por_variables_de_entorno():
     assert llm_mod.detect_provider({"GEMINI_API_KEY": "k"}) == "gemini"
     assert llm_mod.detect_provider({"LLM_PROVIDER": "ollama", "ANTHROPIC_API_KEY": "k"}) == "ollama"
     c = llm_mod.LLMClient(env={"GEMINI_API_KEY": "k"})
-    assert c.provider == "gemini" and c.model == "gemini-2.5-flash"
+    assert c.provider == "gemini" and c.model == "gemini-3.5-flash-lite"
     assert llm_mod.LLMClient(env={"LLM_PROVIDER": "openai", "LLM_MODEL": "x"}).model == "x"
 
 
@@ -171,4 +171,4 @@ def test_openai_compatible_arma_la_peticion(monkeypatch):
     g = c.generate("sys", "user")
     assert g.text == "hola [1]" and g.input_tokens == 5 and g.output_tokens == 2
     assert capturado["url"].startswith("https://generativelanguage.googleapis.com") and capturado["auth"] == "Bearer clave"
-    assert json.loads(capturado["body"])["model"] == "gemini-2.5-flash"
+    assert json.loads(capturado["body"])["model"] == "gemini-3.5-flash-lite"

@@ -34,7 +34,7 @@ from dataclasses import dataclass
 DEFAULT_MODELS = {
     "anthropic": "claude-opus-5",
     "openai": "gpt-4o-mini",
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.5-flash-lite",
     "groq": "llama-3.3-70b-versatile",
     "ollama": "llama3.2",
     "local": "Qwen/Qwen2.5-1.5B-Instruct",

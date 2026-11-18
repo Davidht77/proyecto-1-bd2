@@ -51,6 +51,25 @@ from backend.rag.pipeline import RagService
 from backend.storage.page import NULL_PAGE
 from backend.storage.schema import ColumnType
 
+def _cargar_env(path: Path = Path(__file__).resolve().parents[2] / ".env") -> None:
+    """Lee KEY=VALOR de un .env local (ignorado por git) sin pisar el entorno.
+
+    Asi la clave del LLM no tiene que exportarse en cada terminal ni quedar en
+    el repositorio.
+    """
+    if not path.exists():
+        return
+    for linea in path.read_text(encoding="utf-8").splitlines():
+        linea = linea.strip()
+        if not linea or linea.startswith("#") or "=" not in linea:
+            continue
+        clave, valor = linea.split("=", 1)
+        os.environ.setdefault(clave.strip(), valor.strip().strip('"').strip("'"))
+
+
+if os.environ.get("BD2_LOAD_DOTENV", "1") == "1":
+    _cargar_env()
+
 DATA_DIR = os.environ.get("BD2_DATA_DIR", "data")
 PAGE_SIZE = int(os.environ.get("BD2_PAGE_SIZE", "4096"))
 CACHE_SIZE = int(os.environ.get("BD2_CACHE_SIZE", "0"))

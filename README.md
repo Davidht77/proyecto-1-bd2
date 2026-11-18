@@ -282,12 +282,16 @@ en modo **extractivo** (recupera, arma el prompt y cita, pero no genera texto):
 | Variable | Proveedor | Modelo por defecto |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | Anthropic (SDK oficial) | `claude-opus-5` |
-| `GEMINI_API_KEY` | Google (endpoint compatible OpenAI) | `gemini-2.5-flash` |
+| `GEMINI_API_KEY` | Google (endpoint compatible OpenAI) | `gemini-3.5-flash-lite` |
 | `GROQ_API_KEY` / `OPENAI_API_KEY` | Groq / OpenAI | `llama-3.3-70b-versatile` / `gpt-4o-mini` |
 | `LLM_BASE_URL` + `LLM_API_KEY` | cualquier API `/chat/completions` (Ollama, OpenRouter…) | `LLM_MODEL` |
 | `LLM_PROVIDER=local` | `transformers` en CPU | `Qwen/Qwen2.5-1.5B-Instruct` |
 
 `LLM_PROVIDER` fuerza uno y `LLM_MODEL` cambia el modelo.
+
+Para no exportar la clave en cada terminal, copia `.env.example` como `.env` en la raíz
+y complétala: la API lo lee al arrancar sin pisar variables ya definidas. `.env` está en
+`.gitignore`, así que la clave no se sube al repositorio.
 
 ### API
 
